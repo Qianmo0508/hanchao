@@ -1,14 +1,12 @@
 /* ================================================================
-   story-patch.js  v1.4
-   修复清单（在 v1.3 基础上）：
-   1. 桌面最后一排 App 名字被裁 -> 每页 16 个 + 底部留白
-   2. 通知点进聊天时消息应已存在 -> 论坛 p1 / 系统公告 预先 push 消息再弹通知
-   3. 好友申请过早出现 -> 清空初始临爽申请，scene9 触发后动态补全
-   4. 头像颜色区分 -> 按名字 hash 分配 12 色
-   5. 设置更全 -> 个人资料页（改昵称 + 头像 emoji 选择）
-   6. 论坛 5月8日前更多内容 + 点赞 + 回复（预设选项）
-   7. 保留 v1.3 全部修复
-   放置位置：主 HTML </body> 之前，作为独立文件 story-patch.js 引入
+   story-patch.js  v1.6
+   v1.6 修复（在 v1.5 基础上）：
+   1. 【新增】首次进入默认关闭"通知抖动"伪 bug（bugNotify = false）；
+      开发者面板仍可手动开启。老存档通过 patchDefaults.bugNotifyOff
+      标记一次性迁移，避免每次刷新都覆盖用户手动设置。
+   2. 保留 v1.5 全部修复（forumLikes 崩溃兜底、每页 12 App、
+      好友申请时序、预推消息、论坛互动、头像颜色、个人资料等）。
+   放置位置：主 HTML </body> 之前，独立文件 story-patch.js
    ================================================================ */
 (function () {
   'use strict';
@@ -24,7 +22,8 @@
         typeof refreshChat !== 'undefined' &&
         typeof CHOICES !== 'undefined' &&
         typeof APP_LIST !== 'undefined' &&
-        typeof DOCK_APPS !== 'undefined') {
+        typeof DOCK_APPS !== 'undefined' &&
+        typeof state !== 'undefined') {
       fn();
     } else {
       setTimeout(function () { ready(fn); }, 80);
@@ -38,8 +37,8 @@
        ============================================================ */
     var st = document.createElement('style');
     st.textContent =
-      '.home-grid{padding-bottom:28px;align-content:start}' +
-      '.app-name{min-height:14px;display:block}' +
+      '.home-grid{padding-bottom:20px;align-content:start;gap:14px 4px}' +
+      '.app-name{min-height:14px;display:block;line-height:1.2}' +
       '.floor-actions{display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap}' +
       '.floor-btn{background:none;border:none;font-size:var(--fs-xs);color:var(--c-text-2);padding:4px 8px;border-radius:6px;cursor:pointer;min-height:28px;display:inline-flex;align-items:center;gap:2px}' +
       '.floor-btn:active{background:var(--c-card-2)}' +
@@ -47,7 +46,6 @@
       '.floor-reply{margin-top:6px;padding:8px 10px;background:var(--c-card-2);border-radius:8px;font-size:var(--fs-s);line-height:1.5;overflow-wrap:anywhere}' +
       '.post-like-btn{background:none;border:none;font-size:var(--fs-xs);color:var(--c-text-3);padding:2px 8px;border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;gap:3px}' +
       '.post-like-btn.liked{color:var(--c-accent)}' +
-      '.avatar[style], .msg-av[style]{font-weight:600}' +
       '.profile-avatar-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}' +
       '.profile-avatar-opt{width:52px;height:52px;border-radius:14px;border:2px solid transparent;background:var(--c-card-2);font-size:26px;display:flex;align-items:center;justify-content:center;cursor:pointer}' +
       '.profile-avatar-opt.on{border-color:var(--c-accent)}';
@@ -64,32 +62,54 @@
     function avatarColor(name) {
       if (!name) return PALETTE[0];
       var h = 5381;
-      for (var i = 0; i < name.length; i++) {
-        h = ((h << 5) + h) + name.charCodeAt(i);
-      }
+      for (var i = 0; i < name.length; i++) h = ((h << 5) + h) + name.charCodeAt(i);
       h = h >>> 0;
       return PALETTE[h % PALETTE.length];
     }
-    function avatarStyle(name) {
-      return 'background:' + avatarColor(name) + ';';
+    function avatarStyle(name) { return 'background:' + avatarColor(name) + ';'; }
+    function profileAvatar() {
+      ensureStateFields();
+      return (state.profile && state.profile.avatar) || '🫥';
     }
-    function profileAvatar() { return (state.profile && state.profile.avatar) || '🫥'; }
-    function profileName() { return (state.profile && state.profile.name) || '陈默'; }
+    function profileName() {
+      ensureStateFields();
+      return (state.profile && state.profile.name) || '陈默';
+    }
 
     /* ============================================================
-       2. 数据初始化 / 清理
+       2. 状态字段兜底
        ============================================================ */
-    if (!state.profile) state.profile = { name: '陈默', avatar: '🫥' };
-    if (!state.forumLikes) state.forumLikes = {};
-    if (!state.forumReplies) state.forumReplies = {};
+    function ensureStateFields() {
+      if (!state) return;
+      if (!state.profile) state.profile = { name: '陈默', avatar: '🫥' };
+      if (!state.forumLikes) state.forumLikes = {};
+      if (!state.forumReplies) state.forumReplies = {};
+      if (!state.flags) state.flags = {};
+      if (!state.db) state.db = {};
+      if (!state.settings) state.settings = {};
+    }
+    ensureStateFields();
 
-    // 清掉初始临爽好友申请（如果剧情还没到 scene9）
-    if (!state.flags.story_scene9) {
+    /* ============================================================
+       2.1 【v1.6 新增】默认关闭"通知抖动"伪 bug
+           只执行一次，用 patchDefaults.bugNotifyOff 标记，
+           避免每次刷新都覆盖开发者在面板里手动开启的设置。
+       ============================================================ */
+    if (!state.patchDefaults) state.patchDefaults = {};
+    if (!state.patchDefaults.bugNotifyOff) {
+      state.settings.bugNotify = false;
+      state.patchDefaults.bugNotifyOff = true;
+      save();
+    }
+
+    /* ============================================================
+       3. 数据初始化 / 旧存档兼容
+       ============================================================ */
+    if (!state.flags.grp3done) {
       state.db.friendRequests = (state.db.friendRequests || []).filter(function (f) {
         return !(f.from === '临爽' && f.status === 'pending');
       });
     }
-    // 兼容 v1.3 老存档：补回预推消息
     if (state.flags.readPost1 && state.db.chats.by &&
         !state.db.chats.by.messages.some(function (m) { return m.text === '我靠别搞啊，有点吓人了'; })) {
       state.db.chats.by.messages.push({
@@ -107,7 +127,6 @@
       });
     }
 
-    // 追加更多 5月8日之前的论坛帖子
     var MORE_POSTS = [
       { id: 'p5', board: 'gossip', author: '路过的风', title: '寒潮封校，宿舍暖气为什么是凉的？',
         time: '2025-05-07 22:15', hot: false, pinned: false, locked: false,
@@ -164,13 +183,14 @@
     }
 
     /* ============================================================
-       3. PAGES.home —— 每页 16 个，保留 v1.3 的引导
+       4. PAGES.home —— 每页 12 个
        ============================================================ */
     PAGES.home = function () {
-      var perPage = 16;
+      ensureStateFields();
+      var perPage = 12;
       var pages = [];
       for (var i = 0; i < APP_LIST.length; i += perPage) pages.push(APP_LIST.slice(i, i + perPage));
-      var unreadMsgs = Object.keys(state.unread).reduce(function (s, k) { return s + (state.unread[k] || 0); }, 0);
+      var unreadMsgs = Object.keys(state.unread || {}).reduce(function (s, k) { return s + (state.unread[k] || 0); }, 0);
 
       var gridHtml = pages.map(function (pg) {
         return '<div class="home-grid">' + pg.map(function (a) {
@@ -233,23 +253,20 @@
           });
 
           if (flag('needMsgGuide') && !flag('msgGuideDone')) {
-            setTimeout(function () {
-              CursorGuide.show('[data-app="messages"]', '去看看消息吧');
-            }, 900);
+            setTimeout(function () { CursorGuide.show('[data-app="messages"]', '去看看消息吧'); }, 900);
           }
           if (flag('forumGuided') && !flag('forumVisited')) {
-            setTimeout(function () {
-              CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛');
-            }, 900);
+            setTimeout(function () { CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛'); }, 900);
           }
         }
       };
     };
 
     /* ============================================================
-       4. PAGES.chat —— 完整重写 + 头像颜色
+       5. PAGES.chat
        ============================================================ */
     PAGES.chat = function (params) {
+      ensureStateFields();
       var cid = params.id;
       var chat = state.db.chats[cid];
       if (!chat) return simplePage('会话不存在', '<div class="empty">该会话不存在或已被删除。</div>');
@@ -334,7 +351,7 @@
     };
 
     /* ============================================================
-       5. onOpenChatPatch 与剧情续播
+       6. onOpenChatPatch + 剧情续播
        ============================================================ */
     function onOpenChatPatch(cid) {
       if (cid !== 'by') return;
@@ -381,13 +398,10 @@
       if (!flag('forumGuided')) {
         flag('forumGuided', true);
         Router.root('home');
-        setTimeout(function () {
-          CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛');
-        }, 900);
+        setTimeout(function () { CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛'); }, 900);
       }
     }
 
-    // 第 6 幕：“我靠别搞啊”已在论坛滚动到底时预推，这里只播后续
     async function runGroup2Patch() {
       var cid = 'by';
       await themSay(cid, '许双荞', '群主是周学姐吗？', 1600);
@@ -404,7 +418,6 @@
       refreshChat(cid);
     }
 
-    // 第 8 幕：张夏夏的“你们看新的通知了没？”已在公告页预推
     async function runScene8MsgsPatch() {
       var cid = 'by';
       await themSay(cid, '沈敏', '看到了，这也太苛刻了吧？！', 1400);
@@ -427,7 +440,7 @@
     }
 
     /* ============================================================
-       6. PAGES.memoDetail —— 打字完成后触发消息引导
+       7. PAGES.memoDetail —— 打字完成后触发消息引导
        ============================================================ */
     var origMemoDetail = PAGES.memoDetail;
     PAGES.memoDetail = function (params) {
@@ -454,9 +467,10 @@
     };
 
     /* ============================================================
-       7. PAGES.forumPost —— 楼层点赞/回复 + 滚动触发通知
+       8. PAGES.forumPost —— 楼层点赞/回复 + 滚动触发通知
        ============================================================ */
     PAGES.forumPost = function (params) {
+      ensureStateFields();
       var p = state.db.forum.posts.find(function (x) { return x.id === params.id; });
       if (!p) return simplePage('帖子', '<div class="empty">帖子已被删除</div>');
 
@@ -512,7 +526,6 @@
             if (triggered || flag('readPost1')) return;
             triggered = true;
             flag('readPost1', true);
-            // 预推消息：临爽：我靠别搞啊
             if (!state.db.chats.by.messages.some(function (m) { return m.text === '我靠别搞啊，有点吓人了'; })) {
               state.db.chats.by.messages.push({
                 id: uid('m'), from: '临爽',
@@ -542,9 +555,10 @@
     };
 
     /* ============================================================
-       8. PAGES.forum —— 更多帖子 + 帖子级点赞
+       9. PAGES.forum —— 更多帖子 + 帖子级点赞
        ============================================================ */
     PAGES.forum = function () {
+      ensureStateFields();
       var board = forumBoard;
       var boards = state.db.forum.boards;
       var curBoard = boards.find(function (b) { return b.id === board; }) || boards[0];
@@ -591,7 +605,7 @@
     };
 
     /* ============================================================
-       9. PAGES.notice —— 滚动触发 + 预推张夏夏消息
+       10. PAGES.notice —— 滚动触发 + 预推张夏夏消息
        ============================================================ */
     PAGES.notice = function () {
       var n = state.db.notice;
@@ -627,7 +641,6 @@
             flag('readNotice', true);
             flag('s8Notified', true);
             flag('pending_s8', true);
-            // 预推：张夏夏：你们看新的通知了没？
             if (!state.db.chats.by.messages.some(function (m) { return m.text === '你们看新的通知了没？'; })) {
               state.db.chats.by.messages.push({
                 id: uid('m'), from: '张夏夏',
@@ -657,10 +670,11 @@
     };
 
     /* ============================================================
-       10. PAGES.messages / contacts / friendRequests —— 头像颜色 + 动态补全
+       11. PAGES.messages / contacts / friendRequests
        ============================================================ */
     PAGES.messages = function () {
-      if (flag('story_scene9') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
+      ensureStateFields();
+      if (flag('grp3done') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
         state.db.friendRequests.push({
           id: 'fr_ls', from: '临爽', avatar: '😆',
           text: '加一下加一下！', time: '2025-05-08 18:20', status: 'pending'
@@ -711,6 +725,7 @@
     };
 
     PAGES.contacts = function () {
+      ensureStateFields();
       var contacts = state.db.contacts.filter(function (c) { return !c.hidden; });
       var listHtml = contacts.map(function (c) {
         return '<div class="row" data-action="open-contact" data-id="' + esc(c.id) + '">' +
@@ -728,7 +743,8 @@
     };
 
     PAGES.friendRequests = function () {
-      if (flag('story_scene9') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
+      ensureStateFields();
+      if (flag('grp3done') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
         state.db.friendRequests.push({
           id: 'fr_ls', from: '临爽', avatar: '😆',
           text: '加一下加一下！', time: '2025-05-08 18:20', status: 'pending'
@@ -763,9 +779,10 @@
     };
 
     /* ============================================================
-       11. PAGES.settings —— 加入个人资料入口
+       12. PAGES.settings —— 加入个人资料入口
        ============================================================ */
     PAGES.settings = function () {
+      ensureStateFields();
       return {
         html: '<div class="page">' +
           navBar('设置') +
@@ -809,11 +826,12 @@
     };
 
     /* ============================================================
-       12. PAGES.profile —— 新增个人资料页
+       13. PAGES.profile —— 个人资料页
        ============================================================ */
     var AVATAR_OPTIONS = ['🫥', '😎', '🐱', '🐼', '🌙', '🍀', '🎧', '🌊', '🔥', '🦊', '🐰', '🦉', '🍎', '🌵', '⭐', '🎈'];
 
     PAGES.profile = function () {
+      ensureStateFields();
       var name = profileName();
       var avatar = profileAvatar();
       var grid = AVATAR_OPTIONS.map(function (e) {
@@ -844,14 +862,14 @@
     };
 
     /* ============================================================
-       13. 新增 action 的捕获阶段拦截
+       14. 新增 action 的捕获阶段拦截
        ============================================================ */
     function handlePatchAction(action, el) {
       if (action === 'open-profile') { Router.push('profile'); return; }
       if (action === 'save-profile') {
+        ensureStateFields();
         var inp = document.getElementById('profile-name');
         if (inp) {
-          state.profile = state.profile || {};
           state.profile.name = (inp.value || '陈默').slice(0, 16).trim() || '陈默';
           save();
           Toast.show('个人资料已保存');
@@ -860,9 +878,9 @@
         return;
       }
       if (action === 'pick-avatar') {
+        ensureStateFields();
         var inp2 = document.getElementById('profile-name');
         if (inp2) {
-          state.profile = state.profile || {};
           state.profile.name = (inp2.value || '陈默').slice(0, 16).trim() || '陈默';
         }
         state.profile.avatar = el.dataset.emoji;
@@ -871,21 +889,11 @@
         return;
       }
       if (action === 'forum-like') {
+        ensureStateFields();
         var key = el.dataset.key;
-        var cur = state.forumLikes[key] || 0;
-        state.forumLikes[key] = cur ? 0 : 1;
+        state.forumLikes[key] = state.forumLikes[key] ? 0 : 1;
         save();
-        var cnt = el.querySelector('.like-cnt');
-        if (cnt) cnt.textContent = state.forumLikes[key] ? '已赞' : '赞';
-        el.classList.toggle('liked', !!state.forumLikes[key]);
-        // 同步数字
-        var txt = el.textContent.replace(/^\s*(已赞|赞)\s*/, '').trim();
-        var base = parseInt(txt, 10) || baseLikes(key);
-        var total = (state.forumLikes[key] ? base : baseLikes(key));
-        // 更稳的做法：直接重算
-        if (el.dataset.key.indexOf('post_') === 0) {
-          el.innerHTML = '<span class="like-cnt">' + (state.forumLikes[key] ? '已赞' : '赞') + '</span> ' + (baseLikes(key) + state.forumLikes[key]);
-        }
+        render();
         return;
       }
       if (action === 'forum-reply') {
@@ -922,6 +930,7 @@
       scrim.addEventListener('click', function (e) {
         var btn = e.target.closest('[data-reply]');
         if (btn) {
+          ensureStateFields();
           var text = btn.dataset.reply;
           if (!state.forumReplies[key]) state.forumReplies[key] = [];
           state.forumReplies[key].push({ text: text, time: fmtFull(sysNow()) });
@@ -936,10 +945,11 @@
     }
 
     /* ============================================================
-       14. Router.push 钩子：标记引导完成
+       15. Router.push 钩子
        ============================================================ */
     var origPush = Router.push.bind(Router);
     Router.push = function (page, params) {
+      ensureStateFields();
       if (page === 'forum' || page === 'forumPost') {
         flag('forumVisited', true);
         CursorGuide.hide();
@@ -951,13 +961,14 @@
     };
 
     /* ============================================================
-       15. 群邀请触发器：看备忘录后，在消息区域累计 8 秒
+       16. 群邀请触发器
        ============================================================ */
     var msgAreaTime = 0;
     var lastTick = Date.now();
     var inviteTriggered = false;
 
     setInterval(function () {
+      ensureStateFields();
       var now = Date.now();
       var dt = now - lastTick;
       lastTick = now;
@@ -982,13 +993,14 @@
     }, 500);
 
     /* ============================================================
-       16. 补触发：如果补丁加载时玩家已在群聊
+       17. 补触发
        ============================================================ */
     setTimeout(function () {
+      ensureStateFields();
       var cur = Router.current();
       if (cur.page === 'chat' && cur.params.id === 'by') onOpenChatPatch('by');
     }, 800);
 
-    console.log('[story-patch v1.4] 已加载：论坛互动 / 头像颜色 / 个人资料 / 消息时序修复');
+    console.log('[story-patch v1.6] 已加载：默认关闭通知抖动 + v1.5 全部修复');
   });
 })();
