@@ -1,28 +1,23 @@
 /* ================================================================
-   story-speed.js  v3.0
+   story-speed.js  v3.1
    加载顺序：story-patch.js → story-extension.js → story-speed.js
 
-   v3.0 彻底修复：
-   1. 【论坛帖子消失】包装 PAGES.forum，每次渲染前强制合并 p5~p10
-      （不依赖 story-patch.js 加载顺序 / 旧存档）
-   2. 【旧剧情速度不统一】根因：
-      - story-patch.js 的 themSayP 硬编码 ×1.3
-      - 主代码 CHOICES.grp1/grp2/grp3 用 meSay/themSay（×1.0）
-      - story-extension.js 用 ensureMsg（×1.0）
-      → 三套速度混用
-      修复：
-      a) 覆盖 window.meSay / window.themSay：统一乘 getSpeed()
-      b) 完全重写 story-patch.js 的 runGroup1/2/Scene8，用 ensureMsgP
-      c) 完全重写 story-extension.js 的 playLinShuangOpening/playS9Group/
-         playS9PostChoice，用 ensureMsgP
-      d) 完全重写 CHOICES.ls_opening / grp_s9，用 ensureMsgP
-      → 所有消息速度 = base × getSpeed()，绝对均匀
-   3. 【流程可靠性】PAGES.chat 的 mount 完全接管：
-      只调用 onChatOpenSpeed，不调用 prevMount（避开 story-patch.js /
-      story-extension.js 里的 onOpenChatPatch 重复触发），由本文件
-      独立管理 ls / by 的所有阶段
-   4. 【stage 迁移】旧存档 ls_stage=3 / s9_stage=3 自动迁移到新阶段
-   5. 【设置入口】设置 → 触感反馈下方新增"消息显示速度"六档
+   v3.1 修复：
+   【选项前后速度仍不均】根因：主代码 CHOICES.grp1/grp2/grp3 的
+   meSay/themSay/sysNote 传入的 delay 本身就短（400/700/800），
+   覆盖后只是乘以速度系数，基准值还在起决定作用。
+   修复：彻底忽略主代码传入的 delay，改为固定基准 —— 
+     · meSay    一律 base 800ms
+     · themSay  一律 base 1500ms
+     · sysNote  一律 base 800ms
+   再乘上 getSpeed()（默认 1.3x），所有场景（选项前/选项后）
+   角色 1950ms、玩家 1040ms、系统 1040ms，绝对均匀。
+
+   保留 v3.0 全部内容：
+   1. 论坛帖子 p5~p10 恢复（加载时 + 每次渲染强制合并）
+   2. 独立管理 ls / by 所有阶段（不依赖 story-patch / extension）
+   3. 设置 → 触感反馈下方"消息显示速度"六档
+   4. stage 迁移、断点续播
    ================================================================ */
 (function () {
   'use strict';
@@ -88,25 +83,36 @@
     }
 
     /* ============================================================
-       3. 覆盖 themSay / meSay（影响主代码 CHOICES.grp1/grp2/grp3）
+       3. 完全覆盖 themSay / meSay / sysNote
+          关键：忽略主代码传入的 delay，全部用固定基准。
+          · themSay  base 1500ms（角色消息）
+          · meSay    base 800ms （玩家消息）
+          · sysNote  base 800ms （系统消息）
+          × getSpeed() 后
+          · 角色 1950ms、玩家 1040ms、系统 1040ms（默认 1.3x）
        ============================================================ */
     var _origThemSay = window.themSay;
     var _origMeSay = window.meSay;
+    var _origSysNote = window.sysNote;
+
     if (typeof _origThemSay === 'function') {
       window.themSay = function (cid, name, text, delay) {
-        var base = delay == null ? 900 : delay;
-        return _origThemSay(cid, name, text, _dl(base));
+        return _origThemSay(cid, name, text, _dl(1500));
       };
     }
     if (typeof _origMeSay === 'function') {
       window.meSay = function (cid, text, delay) {
-        var base = delay == null ? 700 : delay;
-        return _origMeSay(cid, text, _dl(base));
+        return _origMeSay(cid, text, _dl(800));
+      };
+    }
+    if (typeof _origSysNote === 'function') {
+      window.sysNote = function (cid, text, delay) {
+        return _origSysNote(cid, text, _dl(800));
       };
     }
 
     /* ============================================================
-       4. 论坛帖子恢复（补丁 + 每次渲染前强制合并）
+       4. 论坛帖子恢复
        ============================================================ */
     var MORE_POSTS = [
       { id: 'p5', board: 'gossip', author: '路过的风', title: '寒潮封校，宿舍暖气为什么是凉的？',
@@ -164,7 +170,6 @@
     }
     ensureForumPosts();
 
-    // 每次渲染论坛页前强制检查
     var prevForum = PAGES.forum;
     PAGES.forum = function (params) {
       ensureForumPosts();
@@ -172,7 +177,7 @@
     };
 
     /* ============================================================
-       5. playingLock（复用 story-extension 的，或自建）
+       5. playingLock
        ============================================================ */
     var _lock = (window.StoryExtension && window.StoryExtension._playingLock)
       ? window.StoryExtension._playingLock
@@ -181,7 +186,7 @@
     else if (!window.StoryExtension._playingLock) window.StoryExtension._playingLock = _lock;
 
     /* ============================================================
-       6. stage 迁移（旧存档 ls_stage=3 / s9_stage=3）
+       6. stage 迁移
        ============================================================ */
     (function migrateStages() {
       var lsStage = flag('ls_stage') || 0;
@@ -265,10 +270,10 @@
       flag('ls_stage', 1);
       save();
       try {
-        await ensureMsgP('ls', { type: 'system', text: '你已通过对方的好友申请' }, 600);
-        await ensureMsgP('ls', { from: '临爽', text: '特殊期间嘛，有什么事咱俩可以互相照应一下桀桀桀' }, 1400);
+        await ensureMsgP('ls', { type: 'system', text: '你已通过对方的好友申请' }, 800);
+        await ensureMsgP('ls', { from: '临爽', text: '特殊期间嘛，有什么事咱俩可以互相照应一下桀桀桀' }, 1500);
         await ensureMsgP('ls', { from: '临爽', text: '毕竟你就在我对门' }, 1500);
-        await ensureMsgP('ls', { from: '临爽', text: '哦对了，真是靠了我得先把你的备注从王晓歌改到陈默…' }, 1600);
+        await ensureMsgP('ls', { from: '临爽', text: '哦对了，真是靠了我得先把你的备注从王晓歌改到陈默…' }, 1500);
         await sleep(_dl(800));
         flag('ls_stage', 2);
         state.choice = { chatId: 'ls', nodeId: 'ls_opening', options: [
@@ -355,11 +360,11 @@
       if (_lock['by_g1']) return;
       _lock['by_g1'] = true;
       try {
-        await ensureMsgP('by', { from: '沈敏', text: '这不是412的？王晓歌？' }, 1400);
-        await ensureMsgP('by', { from: '沈敏', text: '卧槽你们拉她干嘛啊！？' }, 1600);
-        await ensureMsgP('by', { from: '临爽', text: '？什么，详细说来👂🏻' }, 1600);
-        await ensureMsgP('by', { from: '沈敏', text: '也没什么…就，你自己看看论坛' }, 1600);
-        await sleep(_dl(1400));
+        await ensureMsgP('by', { from: '沈敏', text: '这不是412的？王晓歌？' }, 1500);
+        await ensureMsgP('by', { from: '沈敏', text: '卧槽你们拉她干嘛啊！？' }, 1500);
+        await ensureMsgP('by', { from: '临爽', text: '？什么，详细说来👂🏻' }, 1500);
+        await ensureMsgP('by', { from: '沈敏', text: '也没什么…就，你自己看看论坛' }, 1500);
+        await sleep(_dl(1200));
         if (!flag('forumGuided')) {
           flag('forumGuided', true);
           Router.root('home');
@@ -373,7 +378,7 @@
       _lock['by_g2'] = true;
       try {
         await ensureMsgP('by', { from: '许双荞', text: '群主是周学姐吗？' }, 1500);
-        await ensureMsgP('by', { from: '沈敏', text: '@周学姐 学姐拉她干嘛啊啊别来索我命我什么都没干' }, 1600);
+        await ensureMsgP('by', { from: '沈敏', text: '@周学姐 学姐拉她干嘛啊啊别来索我命我什么都没干' }, 1500);
         await sleep(_dl(800));
         state.choice = { chatId: 'by', nodeId: 'grp1', options: [
           { k: 'a', label: '①我是她室友陈默' },
@@ -388,14 +393,14 @@
       if (_lock['by_s8']) return;
       _lock['by_s8'] = true;
       try {
-        await ensureMsgP('by', { from: '沈敏', text: '看到了，这也太苛刻了吧？！' }, 1400);
-        await ensureMsgP('by', { from: '临爽', text: '才特么6点就不让出楼…是人吗…' }, 1600);
-        await ensureMsgP('by', { from: '许双荞', text: '现在貌似已经六点了' }, 1600);
-        await ensureMsgP('by', { from: '周学姐', text: '@所有人 现在开始所有人不要出楼！' }, 1600);
-        await ensureMsgP('by', { from: '邓许', text: '我倒是有个疑问啊……' }, 1600);
-        await ensureMsgP('by', { from: '邓许', text: '寒潮是寒潮，出个宿舍楼和“人身安全”有什么关系？' }, 1600);
-        await ensureMsgP('by', { from: '邓许', text: '又和固定的时间有什么关系？' }, 1600);
-        await ensureMsgP('by', { from: '沈敏', text: '说的对啊……顶多被冻着，可这应该算健康问题，怎么能算人身安全' }, 1600);
+        await ensureMsgP('by', { from: '沈敏', text: '看到了，这也太苛刻了吧？！' }, 1500);
+        await ensureMsgP('by', { from: '临爽', text: '才特么6点就不让出楼…是人吗…' }, 1500);
+        await ensureMsgP('by', { from: '许双荞', text: '现在貌似已经六点了' }, 1500);
+        await ensureMsgP('by', { from: '周学姐', text: '@所有人 现在开始所有人不要出楼！' }, 1500);
+        await ensureMsgP('by', { from: '邓许', text: '我倒是有个疑问啊……' }, 1500);
+        await ensureMsgP('by', { from: '邓许', text: '寒潮是寒潮，出个宿舍楼和“人身安全”有什么关系？' }, 1500);
+        await ensureMsgP('by', { from: '邓许', text: '又和固定的时间有什么关系？' }, 1500);
+        await ensureMsgP('by', { from: '沈敏', text: '说的对啊……顶多被冻着，可这应该算健康问题，怎么能算人身安全' }, 1500);
         await sleep(_dl(800));
         state.choice = { chatId: 'by', nodeId: 'grp3', options: [
           { k: 'a', label: '①也许是现在很冷呢？' },
@@ -439,11 +444,11 @@
       flag('s9_stage', 1);
       save();
       try {
-        await ensureMsgP('by', { from: '周学姐', text: '你们对这次"寒潮预警"有什么想法么……？' }, 1400);
-        await ensureMsgP('by', { from: '许双荞', text: '怪怪的，现在才五月份啊' }, 1600);
-        await ensureMsgP('by', { from: '临爽', text: '？我靠你不说我都忘了，现在是5月啊！！哪门子的寒潮我问你' }, 1600);
-        await ensureMsgP('by', { from: '苏青', text: '五月飞雪，好一出窦娥冤～' }, 1600);
-        await ensureMsgP('by', { from: '张夏夏', text: '我早就感觉奇怪了，还好提前撤离了……还是在家舒服啊！' }, 1600);
+        await ensureMsgP('by', { from: '周学姐', text: '你们对这次"寒潮预警"有什么想法么……？' }, 1500);
+        await ensureMsgP('by', { from: '许双荞', text: '怪怪的，现在才五月份啊' }, 1500);
+        await ensureMsgP('by', { from: '临爽', text: '？我靠你不说我都忘了，现在是5月啊！！哪门子的寒潮我问你' }, 1500);
+        await ensureMsgP('by', { from: '苏青', text: '五月飞雪，好一出窦娥冤～' }, 1500);
+        await ensureMsgP('by', { from: '张夏夏', text: '我早就感觉奇怪了，还好提前撤离了……还是在家舒服啊！' }, 1500);
         await sleep(_dl(800));
         flag('s9_stage', 2);
         state.choice = { chatId: 'by', nodeId: 'grp_s9', options: [
@@ -462,12 +467,12 @@
       save();
       try {
         await ensureMsgP('by', { from: '周学姐', text: '嗯，别的不敢多说，这也是我来找大家的目的。' }, 1500);
-        await ensureMsgP('by', { from: '周学姐', text: '北苑的同学们，麻烦大家配合一下，填写以下问卷，我会反馈这一切的蹊跷。' }, 1700);
+        await ensureMsgP('by', { from: '周学姐', text: '北苑的同学们，麻烦大家配合一下，填写以下问卷，我会反馈这一切的蹊跷。' }, 1500);
         await ensureMsgP('by', { from: '临爽', text: '啊靠——都这时候了还要填excel，不要啊！！！（震声' }, 1500);
         await ensureMsgP('by', { from: '周学姐', text: '哈哈别急，除了excel还有你们最爱的ddl' }, 1500);
-        await ensureMsgP('by', { from: '周学姐', text: '请大家在今晚前提交给我。' }, 1400);
-        await ensureMsgP('by', { from: '张夏夏', text: '我、我也要交吗？' }, 1400);
-        await ensureMsgP('by', { from: '周学姐', text: '。。你不用' }, 1200);
+        await ensureMsgP('by', { from: '周学姐', text: '请大家在今晚前提交给我。' }, 1500);
+        await ensureMsgP('by', { from: '张夏夏', text: '我、我也要交吗？' }, 1500);
+        await ensureMsgP('by', { from: '周学姐', text: '。。你不用' }, 1500);
         await sleep(_dl(800));
         var hasLink = state.db.chats.by.messages.some(function (m) {
           return m.from === '周学姐' && m.text === '【问卷链接】';
@@ -493,7 +498,7 @@
     }
 
     /* ============================================================
-       11. CHOICES.ls_opening / grp_s9 重写（统一速度）
+       11. CHOICES.ls_opening / grp_s9
        ============================================================ */
     CHOICES.ls_opening = {
       async a() {
@@ -522,7 +527,7 @@
           save();
           refreshChat('ls');
           await ensureMsgP('ls', { from: 'me', text: '封楼期间欢迎你来412大吃特吃嗷' }, 800);
-          await ensureMsgP('ls', { from: 'me', text: 'VVIP贵宾一位里边儿请～' }, 1200);
+          await ensureMsgP('ls', { from: 'me', text: 'VVIP贵宾一位里边儿请～' }, 800);
           await ensureMsgP('ls', { from: '临爽', text: '这老板恐怕是邓许吧' }, 1500);
           await ensureMsgP('ls', { from: '临爽', text: '你只能算个服务员哈哈哈哈' }, 1500);
           await ensureMsgP('ls', { from: 'me', text: '我去你的！' }, 800);
@@ -549,14 +554,12 @@
           await ensureMsgP('by', { from: '张夏夏', text: '一线吃瓜～' }, 1500);
           await ensureMsgP('by', { from: '周学姐', text: '我拉的，因为貌似她只能通过这个群和我们联系。' }, 1500);
           await ensureMsgP('by', { from: '临爽', text: '挖什么金矿' }, 1500);
-          await ensureMsgP('by', { from: '张夏夏', text: '是这样的…封校那天我发现我联系不上你们任何一个人，直到看到论坛里有这个群的链接，我才好歹能和你们说上话！' }, 1700);
+          await ensureMsgP('by', { from: '张夏夏', text: '是这样的…封校那天我发现我联系不上你们任何一个人，直到看到论坛里有这个群的链接，我才好歹能和你们说上话！' }, 1500);
           await ensureMsgP('by', { from: '张夏夏', text: '我似乎是一出校就被识别为"校外人员"了……总之珍惜吧！' }, 1500);
           await ensureMsgP('by', { from: '苏青', text: '确实呢，我现在一想和校外的朋友联系就会弹出一个警告' }, 1500);
           await ensureMsgP('by', { from: '沈敏', text: '对，好像是什么"寒潮期间禁止与校外人员通讯"，弱智极了' }, 1500);
-          await ensureMsgP('by', { from: 'me', text: '这不是把我们大家都囚禁在渠中了吗……切断一切外界联系' }, 900);
+          await ensureMsgP('by', { from: 'me', text: '这不是把我们大家都囚禁在渠中了吗……切断一切外界联系' }, 800);
           await ensureMsgP('by', { from: '邓许', text: '寒潮真的至于这样吗？我不敢苟同' }, 1500);
-
-          // 备忘录线索
           var title = '线索：校外人员？';
           if (!state.db.memos.some(function (m) { return m.title === title; })) {
             state.db.memos.push({
@@ -581,15 +584,15 @@
           save();
           refreshChat('by');
           await ensureMsgP('by', { from: 'me', text: '真羡慕你啊……' }, 800);
-          await ensureMsgP('by', { from: 'me', text: '我是真受不了这个雷霆规则了！' }, 1200);
+          await ensureMsgP('by', { from: 'me', text: '我是真受不了这个雷霆规则了！' }, 800);
           await ensureMsgP('by', { from: '沈敏', text: '是啊，根本不是给人用的' }, 1500);
-          await ensureMsgP('by', { from: '临爽', text: 'md真的太痛苦了，我们完全就是被囚禁圈养在渠中的牲畜啊！' }, 1600);
+          await ensureMsgP('by', { from: '临爽', text: 'md真的太痛苦了，我们完全就是被囚禁圈养在渠中的牲畜啊！' }, 1500);
           await ensureMsgP('by', { from: '周学姐', text: '没有"们"。。。你自己是牲畜就够了。' }, 1500);
-          await ensureMsgP('by', { from: '临爽', text: '？' }, 1200);
-          await ensureMsgP('by', { from: '苏青', text: '太无聊了，姐姐我实在很想去7号楼找你们玩哦，奈何学校不让' }, 1600);
+          await ensureMsgP('by', { from: '临爽', text: '？' }, 1500);
+          await ensureMsgP('by', { from: '苏青', text: '太无聊了，姐姐我实在很想去7号楼找你们玩哦，奈何学校不让' }, 1500);
           await ensureMsgP('by', { from: '苏青', text: '我也很无奈～' }, 1500);
           await ensureMsgP('by', { from: '许双荞', text: '，，似乎你刚说了懒得出校门' }, 1500);
-          await ensureMsgP('by', { from: '张夏夏', text: '哈哈哈我看到你们转发的规则了……哎不是感觉怎么看都怪怪的啊但是' }, 1600);
+          await ensureMsgP('by', { from: '张夏夏', text: '哈哈哈我看到你们转发的规则了……哎不是感觉怎么看都怪怪的啊但是' }, 1500);
           addTrust(['沈敏', '临爽'], 1);
           await ensureMsgP('by', { type: 'system', text: trustNote(['沈敏', '临爽'], 1) }, 800);
           flag('s9_stage', 6);
@@ -643,7 +646,7 @@
           navBar('消息显示速度') +
           '<div class="page-body">' +
             '<div class="card" style="margin-top:var(--sp-3)">' + rows + '</div>' +
-            '<div class="px4 txt-xs txt-3 center mt3">数值越大，消息出现越慢。选项分支前后均按此速度播放。</div>' +
+            '<div class="px4 txt-xs txt-3 center mt3">数值越大，消息出现越慢。选项前后所有对话均按此速度播放。</div>' +
           '</div>' +
         '</div>'
       };
@@ -684,6 +687,6 @@
       SPEED_OPTIONS: SPEED_OPTIONS
     };
 
-    console.log('[story-speed v3.0] 已加载，速度 ' + getSpeed() + 'x，论坛帖子 ' + state.db.forum.posts.length + ' 条');
+    console.log('[story-speed v3.1] 已加载，速度 ' + getSpeed() + 'x，论坛帖子 ' + state.db.forum.posts.length + ' 条');
   });
 })();
