@@ -1,13 +1,14 @@
 /* ================================================================
-   story-patch.js  v1.3
-   在 v1.2 基础上新增/修复：
-   1. 【关键】第6幕群聊2：点击"临爽：我靠别搞啊，有点吓人了"通知回群聊后，
-      自动续播"临爽/许双荞/沈敏"三条新消息，并弹出固定选项1
-      （①我是她室友陈默 / ②其实我一直阴魂不散哦）
-   2. 好友申请时序确认：仅在 grp3 选项（"大家都早点睡"）之后触发
-   3. 好友申请通过后不接任何后续剧情（用户尚未写完，留空）
-   4. 保留 v1.2 所有修复（群邀请 8 秒触发器、论坛/公告滚动触发、
-      备忘录/群聊1引导、只有妈妈弹警示、群消息间隔 1.4~1.7 秒）
+   story-patch.js  v1.4
+   修复清单（在 v1.3 基础上）：
+   1. 桌面最后一排 App 名字被裁 -> 每页 16 个 + 底部留白
+   2. 通知点进聊天时消息应已存在 -> 论坛 p1 / 系统公告 预先 push 消息再弹通知
+   3. 好友申请过早出现 -> 清空初始临爽申请，scene9 触发后动态补全
+   4. 头像颜色区分 -> 按名字 hash 分配 12 色
+   5. 设置更全 -> 个人资料页（改昵称 + 头像 emoji 选择）
+   6. 论坛 5月8日前更多内容 + 点赞 + 回复（预设选项）
+   7. 保留 v1.3 全部修复
+   放置位置：主 HTML </body> 之前，作为独立文件 story-patch.js 引入
    ================================================================ */
 (function () {
   'use strict';
@@ -21,7 +22,9 @@
         typeof Typewriter !== 'undefined' &&
         typeof themSay !== 'undefined' &&
         typeof refreshChat !== 'undefined' &&
-        typeof CHOICES !== 'undefined') {
+        typeof CHOICES !== 'undefined' &&
+        typeof APP_LIST !== 'undefined' &&
+        typeof DOCK_APPS !== 'undefined') {
       fn();
     } else {
       setTimeout(function () { ready(fn); }, 80);
@@ -31,16 +34,225 @@
   ready(function () {
 
     /* ============================================================
-       1. PAGES.chat 完全重写
-          - 仅 cid === 'mom' 保留 data-action="send-blocked"
-          - 其余所有会话输入框 dead，不弹任何提示
+       0. 注入补丁专用样式
+       ============================================================ */
+    var st = document.createElement('style');
+    st.textContent =
+      '.home-grid{padding-bottom:28px;align-content:start}' +
+      '.app-name{min-height:14px;display:block}' +
+      '.floor-actions{display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap}' +
+      '.floor-btn{background:none;border:none;font-size:var(--fs-xs);color:var(--c-text-2);padding:4px 8px;border-radius:6px;cursor:pointer;min-height:28px;display:inline-flex;align-items:center;gap:2px}' +
+      '.floor-btn:active{background:var(--c-card-2)}' +
+      '.floor-btn.liked{color:var(--c-accent)}' +
+      '.floor-reply{margin-top:6px;padding:8px 10px;background:var(--c-card-2);border-radius:8px;font-size:var(--fs-s);line-height:1.5;overflow-wrap:anywhere}' +
+      '.post-like-btn{background:none;border:none;font-size:var(--fs-xs);color:var(--c-text-3);padding:2px 8px;border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;gap:3px}' +
+      '.post-like-btn.liked{color:var(--c-accent)}' +
+      '.avatar[style], .msg-av[style]{font-weight:600}' +
+      '.profile-avatar-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}' +
+      '.profile-avatar-opt{width:52px;height:52px;border-radius:14px;border:2px solid transparent;background:var(--c-card-2);font-size:26px;display:flex;align-items:center;justify-content:center;cursor:pointer}' +
+      '.profile-avatar-opt.on{border-color:var(--c-accent)}';
+    document.head.appendChild(st);
+
+    /* ============================================================
+       1. 头像颜色
+       ============================================================ */
+    var PALETTE = [
+      '#5B8FF9', '#F6903D', '#F6BD16', '#7262FD',
+      '#78D3F8', '#9661BC', '#F08BB4', '#3FB37F',
+      '#E8684A', '#9270CA', '#5AD8A6', '#E8A585'
+    ];
+    function avatarColor(name) {
+      if (!name) return PALETTE[0];
+      var h = 5381;
+      for (var i = 0; i < name.length; i++) {
+        h = ((h << 5) + h) + name.charCodeAt(i);
+      }
+      h = h >>> 0;
+      return PALETTE[h % PALETTE.length];
+    }
+    function avatarStyle(name) {
+      return 'background:' + avatarColor(name) + ';';
+    }
+    function profileAvatar() { return (state.profile && state.profile.avatar) || '🫥'; }
+    function profileName() { return (state.profile && state.profile.name) || '陈默'; }
+
+    /* ============================================================
+       2. 数据初始化 / 清理
+       ============================================================ */
+    if (!state.profile) state.profile = { name: '陈默', avatar: '🫥' };
+    if (!state.forumLikes) state.forumLikes = {};
+    if (!state.forumReplies) state.forumReplies = {};
+
+    // 清掉初始临爽好友申请（如果剧情还没到 scene9）
+    if (!state.flags.story_scene9) {
+      state.db.friendRequests = (state.db.friendRequests || []).filter(function (f) {
+        return !(f.from === '临爽' && f.status === 'pending');
+      });
+    }
+    // 兼容 v1.3 老存档：补回预推消息
+    if (state.flags.readPost1 && state.db.chats.by &&
+        !state.db.chats.by.messages.some(function (m) { return m.text === '我靠别搞啊，有点吓人了'; })) {
+      state.db.chats.by.messages.push({
+        id: uid('m'), from: '临爽',
+        text: '我靠别搞啊，有点吓人了',
+        time: '2025-05-08 18:16'
+      });
+    }
+    if (state.flags.readNotice && state.db.chats.by &&
+        !state.db.chats.by.messages.some(function (m) { return m.text === '你们看新的通知了没？'; })) {
+      state.db.chats.by.messages.push({
+        id: uid('m'), from: '张夏夏',
+        text: '你们看新的通知了没？',
+        time: '2025-05-08 18:30'
+      });
+    }
+
+    // 追加更多 5月8日之前的论坛帖子
+    var MORE_POSTS = [
+      { id: 'p5', board: 'gossip', author: '路过的风', title: '寒潮封校，宿舍暖气为什么是凉的？',
+        time: '2025-05-07 22:15', hot: false, pinned: false, locked: false,
+        floors: [
+          { n: 2, user: '冬眠中', text: '同感，我穿了两件外套还是冷' },
+          { n: 3, user: '路过的风', quote: '冬眠中', text: '后勤说管道检修，不知道要修多久' },
+          { n: 4, user: '雪上加霜', text: '这波寒潮来得很突然啊' }
+        ] },
+      { id: 'p6', board: 'gossip', author: '不吃香菜', title: '7号楼最近晚上总有人在楼道里走',
+        time: '2025-05-05 23:48', hot: true, pinned: false, locked: false,
+        floors: [
+          { n: 2, user: '不吃香菜', text: '昨晚 11 点多我出去接水，听见楼上一直有脚步声' },
+          { n: 3, user: '夜猫子', text: '四楼？我也听到过' },
+          { n: 4, user: '纯情蟑螂火辣辣', text: '别吓人啊，说不定是宿管巡楼' },
+          { n: 5, user: '冬眠中', quote: '纯情蟑螂火辣辣', text: '宿管巡楼穿拖鞋？' }
+        ] },
+      { id: 'p7', board: 'study', author: '学霸本霸', title: '期中物理复习资料整理（可自取）',
+        time: '2025-05-04 19:30', hot: false, pinned: false, locked: false,
+        floors: [
+          { n: 2, user: '学霸本霸', text: '整理了一份电磁学+光学的重点，有需要的同学看置顶链接' },
+          { n: 3, user: '学渣在线', text: '大佬！' }
+        ] },
+      { id: 'p8', board: 'lost', author: '失物招领处', title: '7号楼二层的吹风机是谁的？',
+        time: '2025-05-03 20:00', hot: false, pinned: false, locked: false,
+        floors: [
+          { n: 2, user: '失物招领处', text: '挂在洗漱间三天了，失主来宿管处认领' }
+        ] },
+      { id: 'p9', board: 'gossip', author: '韦二敏', title: '有没有人觉得最近小渠越来越像个人了',
+        time: '2025-05-02 21:11', hot: false, pinned: false, locked: false,
+        floors: [
+          { n: 2, user: '韦二敏', text: '问它什么问题都能答上来，语气还很自然' },
+          { n: 3, user: '404NotFound', text: 'AI 升级了吧，正常' },
+          { n: 4, user: '早八人', text: '别瞎想，写作业去吧' }
+        ] },
+      { id: 'p10', board: 'gossip', author: '固执的鱼', title: '5月1日的校园落日真的绝了',
+        time: '2025-05-01 18:42', hot: false, pinned: false, locked: false,
+        floors: [
+          { n: 2, user: '固执的鱼', text: '操场边拍了张照，天色太美了' },
+          { n: 3, user: '好想刻薄地活一次', text: '那天我也在' }
+        ] }
+    ];
+    MORE_POSTS.forEach(function (p) {
+      if (!state.db.forum.posts.some(function (x) { return x.id === p.id; })) {
+        state.db.forum.posts.push(p);
+      }
+    });
+    save();
+
+    function baseLikes(key) {
+      var h = 5381;
+      for (var i = 0; i < key.length; i++) h = ((h << 5) + h) + key.charCodeAt(i);
+      h = h >>> 0;
+      return (h % 20) + 1;
+    }
+
+    /* ============================================================
+       3. PAGES.home —— 每页 16 个，保留 v1.3 的引导
+       ============================================================ */
+    PAGES.home = function () {
+      var perPage = 16;
+      var pages = [];
+      for (var i = 0; i < APP_LIST.length; i += perPage) pages.push(APP_LIST.slice(i, i + perPage));
+      var unreadMsgs = Object.keys(state.unread).reduce(function (s, k) { return s + (state.unread[k] || 0); }, 0);
+
+      var gridHtml = pages.map(function (pg) {
+        return '<div class="home-grid">' + pg.map(function (a) {
+          var badge = '';
+          if (a.id === 'messages' && unreadMsgs > 0) badge = unreadMsgs > 99 ? '99+' : String(unreadMsgs);
+          return '<button class="app-item" data-action="open-app" data-app="' + esc(a.id) + '" aria-label="' + esc(a.name) + '">' +
+            '<div class="app-icon">' + a.icon + (badge ? '<span class="badge">' + badge + '</span>' : '') + '</div>' +
+            '<div class="app-name">' + esc(a.name) + '</div>' +
+          '</button>';
+        }).join('') + '</div>';
+      }).join('');
+
+      var now = sysNow();
+      var w = state.db.weather;
+
+      return {
+        html: '<div class="page home-page">' +
+          '<div class="home-widget">' +
+            '<div>' +
+              '<div class="w-time">' + fmtHM(now) + '</div>' +
+              '<div class="w-date">' + (now.getMonth() + 1) + '月' + now.getDate() + '日 ' + WEEK_CN[now.getDay()] + '</div>' +
+            '</div>' +
+            '<div class="w-right">' +
+              '<div class="w-temp">' + w.now.temp + '°</div>' +
+              '<div class="w-desc">' + esc(w.now.desc) + ' · 寒潮红色预警</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="home-search" data-action="open-search"><span>🔍</span><span>搜索 App、联系人、设置</span></div>' +
+          '<div class="home-pages" id="home-pages">' + gridHtml + '</div>' +
+          '<div class="page-dots" id="home-dots">' + pages.map(function (_, i) { return '<i class="' + (i === 0 ? 'on' : '') + '"></i>'; }).join('') + '</div>' +
+          '<div class="dock">' + DOCK_APPS.map(function (id) {
+            var a = APP_LIST.find(function (x) { return x.id === id; });
+            if (!a) return '';
+            return '<button class="app-item" data-action="open-app" data-app="' + esc(a.id) + '" aria-label="' + esc(a.name) + '">' +
+              '<div class="app-icon">' + a.icon + '</div>' +
+              '<div class="app-name">' + esc(a.name) + '</div>' +
+            '</button>';
+          }).join('') + '</div>' +
+        '</div>',
+        mount: function (root) {
+          var hp = root.querySelector('#home-pages');
+          var dots = Array.prototype.slice.call(root.querySelectorAll('#home-dots i'));
+          if (hp) {
+            hp.addEventListener('scroll', function () {
+              var idx = Math.round(hp.scrollLeft / hp.clientWidth);
+              dots.forEach(function (d, i) { d.classList.toggle('on', i === idx); });
+            }, { passive: true });
+          }
+          var pressTimer = null;
+          root.addEventListener('pointerdown', function (e) {
+            if (!e.target.closest('.app-item')) return;
+            pressTimer = setTimeout(function () {
+              document.body.classList.add('jiggle');
+              vibrate(20);
+              setTimeout(function () { document.body.classList.remove('jiggle'); }, 1200);
+            }, 650);
+          });
+          ['pointerup', 'pointercancel', 'pointermove'].forEach(function (ev) {
+            root.addEventListener(ev, function () { clearTimeout(pressTimer); });
+          });
+
+          if (flag('needMsgGuide') && !flag('msgGuideDone')) {
+            setTimeout(function () {
+              CursorGuide.show('[data-app="messages"]', '去看看消息吧');
+            }, 900);
+          }
+          if (flag('forumGuided') && !flag('forumVisited')) {
+            setTimeout(function () {
+              CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛');
+            }, 900);
+          }
+        }
+      };
+    };
+
+    /* ============================================================
+       4. PAGES.chat —— 完整重写 + 头像颜色
        ============================================================ */
     PAGES.chat = function (params) {
       var cid = params.id;
       var chat = state.db.chats[cid];
-      if (!chat) {
-        return simplePage('会话不存在', '<div class="empty">该会话不存在或已被删除。</div>');
-      }
+      if (!chat) return simplePage('会话不存在', '<div class="empty">该会话不存在或已被删除。</div>');
       state.unread[cid] = 0;
       save();
 
@@ -52,7 +264,7 @@
         }
         if (m.type === 'card') {
           msgsHtml += '<div class="msg">' +
-            '<div class="msg-av">' + esc(chat.avatar) + '</div>' +
+            '<div class="msg-av" style="' + avatarStyle(chat.name) + '">' + esc(chat.avatar) + '</div>' +
             '<div class="msg-wrap">' +
               '<div class="msg-name">' + esc(m.title) + '</div>' +
               '<div class="gzh-card" data-action="gzh-card">' +
@@ -73,8 +285,10 @@
             '" data-params="' + esc(JSON.stringify(m.link.params || {})) + '">' +
             esc(m.link.text) + '</span>');
         }
+        var avKey = isMe ? profileName() : (chat.type === 'group' ? (m.from || '?') : chat.name);
+        var avEmoji = isMe ? profileAvatar() : (chat.type === 'group' ? (m.from || '?').slice(0, 1) : chat.avatar);
         msgsHtml += '<div class="msg ' + (isMe ? 'me' : '') + '">' +
-          '<div class="msg-av">' + (isMe ? '🫥' : esc(chat.type === 'group' ? (m.from || '?').slice(0, 1) : chat.avatar)) + '</div>' +
+          '<div class="msg-av" style="' + avatarStyle(avKey) + '">' + avEmoji + '</div>' +
           '<div class="msg-wrap">' +
             (showName ? '<div class="msg-name">' + esc(m.from) + '</div>' : '') +
             '<div class="bubble">' + textHtml + '</div>' +
@@ -120,12 +334,7 @@
     };
 
     /* ============================================================
-       2. onOpenChatPatch：群聊进入钩子
-          按剧情顺序依次检测：
-          a) 首次进群 → 加入系统消息
-          b) 第4幕群聊1（grp1msgs）
-          c) 第6幕群聊2（grp2msgs）—— 需 readPost1 为真且当前无等待选项
-          d) 第8幕群聊（s8msgs）—— 需 pending_s8 为真
+       5. onOpenChatPatch 与剧情续播
        ============================================================ */
     function onOpenChatPatch(cid) {
       if (cid !== 'by') return;
@@ -135,32 +344,25 @@
         chat.joined = true;
         if (!chat.messages.length) {
           chat.messages.push({
-            id: uid('m'),
-            type: 'system',
-            text: '“王晓歌”被拉入群聊',
-            time: '2025-05-08 18:02'
+            id: uid('m'), type: 'system',
+            text: '“王晓歌”被拉入群聊', time: '2025-05-08 18:02'
           });
         }
         save();
         setTimeout(function () { render(); }, 40);
       }
 
-      // 第4幕群聊1
       if (flag('invited') && !flag('grp1msgs')) {
         flag('grp1msgs', true);
         setTimeout(function () { runGroup1Patch(); }, 1000);
         return;
       }
-
-      // 第6幕群聊2：玩家已读完论坛帖子，且当前没有未处理的固定选项
       if (flag('readPost1') && !flag('grp2msgs') &&
           !(state.choice && state.choice.chatId === 'by')) {
         flag('grp2msgs', true);
         setTimeout(function () { runGroup2Patch(); }, 1000);
         return;
       }
-
-      // 第8幕群聊
       if (flag('pending_s8') && !flag('s8msgs')) {
         flag('pending_s8', false);
         flag('s8msgs', true);
@@ -169,9 +371,6 @@
       }
     }
 
-    /* ============================================================
-       3. 第4幕群消息 + 论坛引导
-       ============================================================ */
     async function runGroup1Patch() {
       var cid = 'by';
       await themSay(cid, '沈敏', '这不是412的？王晓歌？', 1400);
@@ -179,7 +378,6 @@
       await themSay(cid, '临爽', '？什么，详细说来👂🏻', 1700);
       await themSay(cid, '沈敏', '也没什么…就，你自己看看论坛', 1700);
       await sleep(1500);
-
       if (!flag('forumGuided')) {
         flag('forumGuided', true);
         Router.root('home');
@@ -189,20 +387,14 @@
       }
     }
 
-    /* ============================================================
-       4. 第6幕群消息 + 固定选项1
-          由 readPost1 触发：玩家点"临爽：我靠别搞啊"通知回群聊后自动续播
-       ============================================================ */
+    // 第 6 幕：“我靠别搞啊”已在论坛滚动到底时预推，这里只播后续
     async function runGroup2Patch() {
       var cid = 'by';
-      await themSay(cid, '临爽', '我靠别搞啊，有点吓人了', 1200);
       await themSay(cid, '许双荞', '群主是周学姐吗？', 1600);
       await themSay(cid, '沈敏', '@周学姐 学姐拉她干嘛啊啊别来索我命我什么都没干', 1600);
       await sleep(700);
-
       state.choice = {
-        chatId: cid,
-        nodeId: 'grp1',
+        chatId: cid, nodeId: 'grp1',
         options: [
           { k: 'a', label: '①我是她室友陈默' },
           { k: 'b', label: '②其实我一直阴魂不散哦' }
@@ -212,13 +404,10 @@
       refreshChat(cid);
     }
 
-    /* ============================================================
-       5. 第8幕群消息 + 固定选项2
-       ============================================================ */
+    // 第 8 幕：张夏夏的“你们看新的通知了没？”已在公告页预推
     async function runScene8MsgsPatch() {
       var cid = 'by';
-      await themSay(cid, '张夏夏', '你们看新的通知了没？', 1400);
-      await themSay(cid, '沈敏', '看到了，这也太苛刻了吧？！', 1600);
+      await themSay(cid, '沈敏', '看到了，这也太苛刻了吧？！', 1400);
       await themSay(cid, '临爽', '才特么6点就不让出楼…是人吗…', 1600);
       await themSay(cid, '许双荞', '现在貌似已经六点了', 1600);
       await themSay(cid, '周学姐', '@所有人 现在开始所有人不要出楼！', 1600);
@@ -226,10 +415,8 @@
       await themSay(cid, '邓许', '寒潮是寒潮，出个宿舍楼和“人身安全”有什么关系？', 1600);
       await themSay(cid, '邓许', '又和固定的时间有什么关系？', 1600);
       await themSay(cid, '沈敏', '说的对啊……顶多被冻着，可这应该算健康问题，怎么能算人身安全', 1600);
-
       state.choice = {
-        chatId: cid,
-        nodeId: 'grp3',
+        chatId: cid, nodeId: 'grp3',
         options: [
           { k: 'a', label: '①也许是现在很冷呢？' },
           { k: 'b', label: '②这很不对劲' }
@@ -240,44 +427,15 @@
     }
 
     /* ============================================================
-       6. PAGES.home 包装：显示引导光标
-       ============================================================ */
-    var origHome = PAGES.home;
-    PAGES.home = function () {
-      var def = origHome();
-      var origMount = def.mount;
-      def.mount = function (root) {
-        if (origMount) origMount(root);
-
-        // 备忘录看完后的消息引导
-        if (flag('needMsgGuide') && !flag('msgGuideDone')) {
-          setTimeout(function () {
-            CursorGuide.show('[data-app="messages"]', '去看看消息吧');
-          }, 900);
-        }
-
-        // 群聊1看完后的论坛引导
-        if (flag('forumGuided') && !flag('forumVisited')) {
-          setTimeout(function () {
-            CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛');
-          }, 900);
-        }
-      };
-      return def;
-    };
-
-    /* ============================================================
-       7. PAGES.memoDetail 包装：打字完成后触发消息引导
+       6. PAGES.memoDetail —— 打字完成后触发消息引导
        ============================================================ */
     var origMemoDetail = PAGES.memoDetail;
     PAGES.memoDetail = function (params) {
       var def = origMemoDetail(params);
       if (params.id !== 'memo_open') return def;
-
       var origMount = def.mount;
       def.mount = function (root) {
         if (origMount) origMount(root);
-
         var check = setInterval(function () {
           if (flag('memoRead')) {
             clearInterval(check);
@@ -285,28 +443,32 @@
               flag('memoGuideShown', true);
               flag('needMsgGuide', true);
               var backBtn = root.querySelector('[data-action="back"]');
-              if (backBtn) {
-                CursorGuide.show('[data-action="back"]', '返回桌面，去看看消息');
-              } else {
-                Toast.show('返回桌面，去看看消息吧', 3200);
-              }
+              if (backBtn) CursorGuide.show('[data-action="back"]', '返回桌面，去看看消息');
+              else Toast.show('返回桌面，去看看消息吧', 3200);
             }
           }
         }, 400);
-
         setTimeout(function () { clearInterval(check); }, 40000);
       };
       return def;
     };
 
     /* ============================================================
-       8. PAGES.forumPost 完全重写：滚动到底触发通知
+       7. PAGES.forumPost —— 楼层点赞/回复 + 滚动触发通知
        ============================================================ */
     PAGES.forumPost = function (params) {
       var p = state.db.forum.posts.find(function (x) { return x.id === params.id; });
       if (!p) return simplePage('帖子', '<div class="empty">帖子已被删除</div>');
 
       var floors = p.floors.map(function (f) {
+        var key = p.id + '_' + f.n;
+        var likeKey = 'floor_' + key;
+        var mine = state.forumLikes[likeKey] || 0;
+        var total = baseLikes(likeKey) + mine;
+        var replies = state.forumReplies[key] || [];
+        var replyHtml = replies.map(function (r) {
+          return '<div class="floor-reply">我（' + esc(profileName()) + '）：' + esc(r.text) + '</div>';
+        }).join('');
         return '<div class="floor">' +
           '<div class="floor-head">' +
             '<span class="floor-user">' + esc(f.user) + '</span>' +
@@ -316,6 +478,13 @@
             (f.quote ? '<span class="quote">回复 @' + esc(f.quote) + '：</span>' : '') +
             esc(f.text) +
           '</div>' +
+          '<div class="floor-actions">' +
+            '<button class="floor-btn ' + (mine ? 'liked' : '') + '" data-action="forum-like" data-key="' + esc(likeKey) + '">' +
+              '<span class="like-cnt">' + (mine ? '已赞' : '赞') + '</span> ' + total +
+            '</button>' +
+            (p.locked ? '' : '<button class="floor-btn" data-action="forum-reply" data-key="' + esc(key) + '">回复</button>') +
+          '</div>' +
+          replyHtml +
         '</div>';
       }).join('');
 
@@ -337,13 +506,21 @@
           '</div>' +
         '</div>',
         mount: function (root) {
-          if (!p || p.id !== 'p1' || flag('readPost1')) return;
-
+          if (p.id !== 'p1' || flag('readPost1')) return;
           var triggered = false;
           var trigger = function () {
             if (triggered || flag('readPost1')) return;
             triggered = true;
             flag('readPost1', true);
+            // 预推消息：临爽：我靠别搞啊
+            if (!state.db.chats.by.messages.some(function (m) { return m.text === '我靠别搞啊，有点吓人了'; })) {
+              state.db.chats.by.messages.push({
+                id: uid('m'), from: '临爽',
+                text: '我靠别搞啊，有点吓人了',
+                time: '2025-05-08 18:16'
+              });
+            }
+            save();
             NotifService.push({
               id: 'n_forum_msg',
               title: '北苑留校女生群有新消息',
@@ -351,7 +528,6 @@
               target: { page: 'chat', params: { id: 'by' } }
             });
           };
-
           var body = root.querySelector('#post-body');
           if (body) {
             body.addEventListener('scroll', function () {
@@ -366,7 +542,56 @@
     };
 
     /* ============================================================
-       9. PAGES.notice 完全重写：滚动到底触发第8幕通知
+       8. PAGES.forum —— 更多帖子 + 帖子级点赞
+       ============================================================ */
+    PAGES.forum = function () {
+      var board = forumBoard;
+      var boards = state.db.forum.boards;
+      var curBoard = boards.find(function (b) { return b.id === board; }) || boards[0];
+      var posts = state.db.forum.posts.filter(function (p) { return p.board === board; });
+      posts.sort(function (a, b) {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        return (b.time || '').localeCompare(a.time || '');
+      });
+      var tabs = boards.map(function (b) {
+        return '<button class="ftab ' + (b.id === board ? 'on' : '') + '" data-action="forum-board" data-id="' + esc(b.id) + '">' + esc(b.name) + (b.hot ? ' 🔥' : '') + '</button>';
+      }).join('');
+      var postHtml = posts.map(function (p) {
+        var likeKey = 'post_' + p.id;
+        var mine = state.forumLikes[likeKey] || 0;
+        var total = baseLikes(likeKey) + mine;
+        return '<div class="post-item">' +
+          '<div class="post-head" data-action="open-post" data-id="' + esc(p.id) + '">' +
+            (p.pinned ? '<span class="tag">置顶</span>' : '') +
+            (p.hot ? '<span class="tag hot">热度飙升</span>' : '') +
+            (p.locked ? '<span class="tag gray">禁止回复</span>' : '') +
+            '<span class="post-author">' + esc(p.author) + '</span>' +
+          '</div>' +
+          '<div class="post-title" data-action="open-post" data-id="' + esc(p.id) + '">' + esc(p.title) + '</div>' +
+          '<div class="post-meta">' +
+            '<span>' + esc(p.time) + '</span>' +
+            '<span>' + p.floors.length + ' 楼</span>' +
+            '<button class="post-like-btn ' + (mine ? 'liked' : '') + '" data-action="forum-like" data-key="' + esc(likeKey) + '">' +
+              '<span class="like-cnt">' + (mine ? '已赞' : '赞') + '</span> ' + total +
+            '</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      return {
+        html: '<div class="page">' +
+          navBar('校园论坛', { right: '<button class="nav-btn" data-action="forum-post-tip">发帖</button>' }) +
+          '<div class="forum-tabs">' + tabs + '</div>' +
+          '<div class="page-body">' +
+            (curBoard.hot ? '<div style="padding:0 var(--sp-4) var(--sp-2);"><span class="tag hot">热度飙升</span></div>' : '') +
+            (postHtml || '<div class="empty">本版块暂无帖子</div>') +
+            '<div class="empty txt-xs">校园论坛 · 请文明发言</div>' +
+          '</div>' +
+        '</div>'
+      };
+    };
+
+    /* ============================================================
+       9. PAGES.notice —— 滚动触发 + 预推张夏夏消息
        ============================================================ */
     PAGES.notice = function () {
       var n = state.db.notice;
@@ -375,7 +600,6 @@
           '<b>' + esc(s.no) + '</b>　' + esc(s.text) +
         '</div>';
       }).join('');
-
       return {
         html: '<div class="page">' +
           navBar('系统公告') +
@@ -396,7 +620,6 @@
         '</div>',
         mount: function (root) {
           if (flag('readNotice')) return;
-
           var triggered = false;
           var trigger = function () {
             if (triggered || flag('readNotice')) return;
@@ -404,6 +627,15 @@
             flag('readNotice', true);
             flag('s8Notified', true);
             flag('pending_s8', true);
+            // 预推：张夏夏：你们看新的通知了没？
+            if (!state.db.chats.by.messages.some(function (m) { return m.text === '你们看新的通知了没？'; })) {
+              state.db.chats.by.messages.push({
+                id: uid('m'), from: '张夏夏',
+                text: '你们看新的通知了没？',
+                time: '2025-05-08 18:30'
+              });
+            }
+            save();
             NotifService.push({
               id: 'n_s8',
               title: '北苑留校女生群有新消息',
@@ -411,7 +643,6 @@
               target: { page: 'chat', params: { id: 'by' } }
             });
           };
-
           var body = root.querySelector('#notice-body');
           if (body) {
             body.addEventListener('scroll', function () {
@@ -426,7 +657,286 @@
     };
 
     /* ============================================================
-       10. Router.push 钩子：标记引导完成
+       10. PAGES.messages / contacts / friendRequests —— 头像颜色 + 动态补全
+       ============================================================ */
+    PAGES.messages = function () {
+      if (flag('story_scene9') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
+        state.db.friendRequests.push({
+          id: 'fr_ls', from: '临爽', avatar: '😆',
+          text: '加一下加一下！', time: '2025-05-08 18:20', status: 'pending'
+        });
+        save();
+      }
+      var chats = Object.values(state.db.chats)
+        .filter(function (c) { return c.type !== 'self' || c.id === 'wxg'; })
+        .filter(function (c) { return c.joined !== false; });
+      chats.sort(function (a, b) { return lastMsgTime(b).localeCompare(lastMsgTime(a)); });
+
+      var pendingFR = (state.db.friendRequests || []).filter(function (f) { return f.status === 'pending'; });
+
+      var rows = chats.map(function (c) {
+        var last = c.messages[c.messages.length - 1];
+        var preview = last ? (last.type === 'card' ? '[卡片] ' + last.desc : (last.text || '')) : '';
+        var unread = state.unread[c.id] || 0;
+        return '<div class="row" data-action="open-chat" data-id="' + esc(c.id) + '">' +
+          '<div class="avatar ' + (c.type === 'group' ? '' : 'round') + '" style="' + avatarStyle(c.name) + '">' + esc(c.avatar) + '</div>' +
+          '<div class="r-main">' +
+            '<div class="r-title">' + esc(c.name) + '</div>' +
+            '<div class="r-sub">' + esc(preview) + '</div>' +
+          '</div>' +
+          '<div class="r-right">' +
+            (unread ? '<span class="badge">' + (unread > 99 ? '99+' : unread) + '</span>' : '<span class="txt-3 txt-xs">' + esc(shortTime(last ? last.time : '')) + '</span>') +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      var frRow = pendingFR.length ? '<div class="row" data-action="open-friend-requests">' +
+        '<div class="avatar round" style="background:var(--c-card-2);">➕</div>' +
+        '<div class="r-main"><div class="r-title">新的朋友</div><div class="r-sub">' + pendingFR.length + ' 条待处理</div></div>' +
+        '<div class="r-right"><span class="badge">' + pendingFR.length + '</span></div>' +
+      '</div>' : '';
+
+      return {
+        html: '<div class="page">' +
+          navBar('消息', {
+            back: true,
+            right: '<button class="nav-btn" data-action="open-contacts" aria-label="通讯录">通讯录</button>'
+          }) +
+          '<div class="page-body">' +
+            '<div class="card" style="margin-top:var(--sp-3)">' + frRow + rows + '</div>' +
+            '<div class="empty txt-xs">寒潮期间，校外通讯已被限制</div>' +
+          '</div>' +
+        '</div>'
+      };
+    };
+
+    PAGES.contacts = function () {
+      var contacts = state.db.contacts.filter(function (c) { return !c.hidden; });
+      var listHtml = contacts.map(function (c) {
+        return '<div class="row" data-action="open-contact" data-id="' + esc(c.id) + '">' +
+          '<div class="avatar round" style="' + avatarStyle(c.name) + '">' + esc(c.avatar) + '</div>' +
+          '<div class="r-main"><div class="r-title">' + esc(c.name) + '</div><div class="r-sub">' + esc(c.note || '') + '</div></div>' +
+          '<span class="chev-r">›</span>' +
+        '</div>';
+      }).join('');
+      return {
+        html: '<div class="page">' +
+          navBar('通讯录', { right: '<button class="nav-btn" data-action="open-friend-requests">新的朋友</button>' }) +
+          '<div class="page-body"><div class="card" style="margin-top:var(--sp-3)">' + listHtml + '</div></div>' +
+        '</div>'
+      };
+    };
+
+    PAGES.friendRequests = function () {
+      if (flag('story_scene9') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
+        state.db.friendRequests.push({
+          id: 'fr_ls', from: '临爽', avatar: '😆',
+          text: '加一下加一下！', time: '2025-05-08 18:20', status: 'pending'
+        });
+        save();
+      }
+      var list = state.db.friendRequests || [];
+      var items = list.map(function (f) {
+        return '<div class="card" style="padding:var(--sp-4);">' +
+          '<div class="flex ac gap3" style="min-width:0;">' +
+            '<div class="avatar round" style="' + avatarStyle(f.from) + '">' + esc(f.avatar) + '</div>' +
+            '<div class="r-main" style="min-width:0;">' +
+              '<div class="bold">' + esc(f.from) + '</div>' +
+              '<div class="txt-s txt-2 wrap">' + esc(f.text) + '</div>' +
+              '<div class="txt-xs txt-3" style="margin-top:2px;">' + esc(f.time) + '</div>' +
+            '</div>' +
+            '<div class="flex gap2" style="flex:0 0 auto;">' +
+              (f.status === 'pending'
+                ? '<button class="btn sm" data-action="fr-accept" data-id="' + esc(f.id) + '">通过</button>' +
+                  '<button class="btn ghost sm" data-action="fr-ignore" data-id="' + esc(f.id) + '">忽略</button>'
+                : '<span class="tag gray">' + (f.status === 'accepted' ? '已通过' : '已忽略') + '</span>') +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      return {
+        html: '<div class="page">' +
+          navBar('新的朋友') +
+          '<div class="page-body" style="padding-top:var(--sp-3);">' + (items || '<div class="empty">暂无好友申请</div>') + '</div>' +
+        '</div>'
+      };
+    };
+
+    /* ============================================================
+       11. PAGES.settings —— 加入个人资料入口
+       ============================================================ */
+    PAGES.settings = function () {
+      return {
+        html: '<div class="page">' +
+          navBar('设置') +
+          '<div class="page-body">' +
+            '<div class="card" style="margin-top:var(--sp-3);">' +
+              '<div class="row" data-action="open-profile">' +
+                '<div class="avatar" style="' + avatarStyle(profileName()) + 'width:44px;height:44px;font-size:22px;">' + esc(profileAvatar()) + '</div>' +
+                '<div class="r-main"><div class="r-title">' + esc(profileName()) + '</div><div class="r-sub">个人资料</div></div>' +
+                '<span class="chev-r">›</span>' +
+              '</div>' +
+              '<div class="row" data-action="set-time">' +
+                '<div class="r-main"><div class="r-title">日期与时间</div><div class="r-sub">' + esc(sysTimeStr()) + '</div></div>' +
+                '<span class="chev-r">›</span>' +
+              '</div>' +
+              '<div class="row" data-action="toggle-theme">' +
+                '<div class="r-main"><div class="r-title">深色模式</div></div>' +
+                '<span class="r-right">' + (state.theme === 'dark' ? '已开启' : '已关闭') + '</span>' +
+              '</div>' +
+              '<div class="row" data-action="toggle-vibrate">' +
+                '<div class="r-main"><div class="r-title">触感反馈</div></div>' +
+                '<span class="r-right">' + (state.settings.vibrate ? '开' : '关') + '</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card">' +
+              '<div class="row" data-action="open-dev-gate">' +
+                '<div class="r-main"><div class="r-title">关于本机</div><div class="r-sub">QuOS 3.2.1 · 点击查看</div></div>' +
+                '<span class="chev-r">›</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card">' +
+              '<div class="row" data-action="factory-reset">' +
+                '<div class="r-main"><div class="r-title txt-danger">恢复出厂设置</div><div class="r-sub">高风险操作，将清除本机全部数据</div></div>' +
+                '<span class="chev-r">›</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="px4 txt-xs txt-3 center mt4">本设备属于：' + esc(DATA.device.owner) + '</div>' +
+            '<div style="height:var(--sp-6)"></div>' +
+          '</div>' +
+        '</div>'
+      };
+    };
+
+    /* ============================================================
+       12. PAGES.profile —— 新增个人资料页
+       ============================================================ */
+    var AVATAR_OPTIONS = ['🫥', '😎', '🐱', '🐼', '🌙', '🍀', '🎧', '🌊', '🔥', '🦊', '🐰', '🦉', '🍎', '🌵', '⭐', '🎈'];
+
+    PAGES.profile = function () {
+      var name = profileName();
+      var avatar = profileAvatar();
+      var grid = AVATAR_OPTIONS.map(function (e) {
+        return '<button class="profile-avatar-opt ' + (avatar === e ? 'on' : '') + '" data-action="pick-avatar" data-emoji="' + e + '" style="' + avatarStyle(e) + '">' + e + '</button>';
+      }).join('');
+      return {
+        html: '<div class="page">' +
+          navBar('个人资料') +
+          '<div class="page-body" style="padding:var(--sp-3);">' +
+            '<div class="card" style="padding:var(--sp-4);">' +
+              '<div class="flex ac gap3" style="min-width:0;">' +
+                '<div class="avatar" style="' + avatarStyle(name) + 'width:64px;height:64px;font-size:32px;">' + esc(avatar) + '</div>' +
+                '<div class="r-main" style="min-width:0;">' +
+                  '<div class="bold" style="font-size:var(--fs-l);">' + esc(name) + '</div>' +
+                  '<div class="txt-s txt-2">当前昵称 / 头像</div>' +
+                '</div>' +
+              '</div>' +
+              '<div class="dev-label">昵称</div>' +
+              '<input class="dev-input" id="profile-name" value="' + esc(name) + '" maxlength="16">' +
+              '<div class="dev-label">头像</div>' +
+              '<div class="profile-avatar-grid">' + grid + '</div>' +
+              '<button class="btn block mt4" data-action="save-profile">保存</button>' +
+            '</div>' +
+            '<div class="px4 txt-xs txt-3 center">头像与昵称仅在本机生效</div>' +
+          '</div>' +
+        '</div>'
+      };
+    };
+
+    /* ============================================================
+       13. 新增 action 的捕获阶段拦截
+       ============================================================ */
+    function handlePatchAction(action, el) {
+      if (action === 'open-profile') { Router.push('profile'); return; }
+      if (action === 'save-profile') {
+        var inp = document.getElementById('profile-name');
+        if (inp) {
+          state.profile = state.profile || {};
+          state.profile.name = (inp.value || '陈默').slice(0, 16).trim() || '陈默';
+          save();
+          Toast.show('个人资料已保存');
+          render();
+        }
+        return;
+      }
+      if (action === 'pick-avatar') {
+        var inp2 = document.getElementById('profile-name');
+        if (inp2) {
+          state.profile = state.profile || {};
+          state.profile.name = (inp2.value || '陈默').slice(0, 16).trim() || '陈默';
+        }
+        state.profile.avatar = el.dataset.emoji;
+        save();
+        render();
+        return;
+      }
+      if (action === 'forum-like') {
+        var key = el.dataset.key;
+        var cur = state.forumLikes[key] || 0;
+        state.forumLikes[key] = cur ? 0 : 1;
+        save();
+        var cnt = el.querySelector('.like-cnt');
+        if (cnt) cnt.textContent = state.forumLikes[key] ? '已赞' : '赞';
+        el.classList.toggle('liked', !!state.forumLikes[key]);
+        // 同步数字
+        var txt = el.textContent.replace(/^\s*(已赞|赞)\s*/, '').trim();
+        var base = parseInt(txt, 10) || baseLikes(key);
+        var total = (state.forumLikes[key] ? base : baseLikes(key));
+        // 更稳的做法：直接重算
+        if (el.dataset.key.indexOf('post_') === 0) {
+          el.innerHTML = '<span class="like-cnt">' + (state.forumLikes[key] ? '已赞' : '赞') + '</span> ' + (baseLikes(key) + state.forumLikes[key]);
+        }
+        return;
+      }
+      if (action === 'forum-reply') {
+        openReplySheet(el.dataset.key);
+        return;
+      }
+    }
+
+    document.addEventListener('click', function (e) {
+      var el = e.target.closest('[data-action]');
+      if (!el) return;
+      var a = el.dataset.action;
+      if (a === 'open-profile' || a === 'save-profile' || a === 'pick-avatar' ||
+          a === 'forum-like' || a === 'forum-reply') {
+        e.stopPropagation();
+        handlePatchAction(a, el);
+      }
+    }, true);
+
+    function openReplySheet(key) {
+      var layers = document.getElementById('layers');
+      if (!layers) return;
+      var opts = ['同问', '理性讨论', '别乱说了', '蹲一个后续'];
+      var scrim = document.createElement('div');
+      scrim.className = 'sheet-scrim';
+      scrim.innerHTML = '<div class="sheet">' +
+        '<div class="sheet-title">选择回复内容</div>' +
+        opts.map(function (o, i) {
+          return '<button class="choice-btn" data-reply="' + esc(o) + '" style="margin-bottom:8px;">' + (i + 1) + '. ' + esc(o) + '</button>';
+        }).join('') +
+        '<button class="btn ghost block sm" data-reply-cancel="1" style="margin-top:8px;">取消</button>' +
+      '</div>';
+      layers.appendChild(scrim);
+      scrim.addEventListener('click', function (e) {
+        var btn = e.target.closest('[data-reply]');
+        if (btn) {
+          var text = btn.dataset.reply;
+          if (!state.forumReplies[key]) state.forumReplies[key] = [];
+          state.forumReplies[key].push({ text: text, time: fmtFull(sysNow()) });
+          save();
+          scrim.remove();
+          render();
+          Toast.show('已回复');
+          return;
+        }
+        if (e.target.closest('[data-reply-cancel]') || e.target === scrim) scrim.remove();
+      });
+    }
+
+    /* ============================================================
+       14. Router.push 钩子：标记引导完成
        ============================================================ */
     var origPush = Router.push.bind(Router);
     Router.push = function (page, params) {
@@ -441,7 +951,7 @@
     };
 
     /* ============================================================
-       11. 群邀请触发器：看备忘录后，在消息区域探索累计 8 秒
+       15. 群邀请触发器：看备忘录后，在消息区域累计 8 秒
        ============================================================ */
     var msgAreaTime = 0;
     var lastTick = Date.now();
@@ -451,26 +961,14 @@
       var now = Date.now();
       var dt = now - lastTick;
       lastTick = now;
-
-      if (inviteTriggered || flag('invited') || !flag('memoRead')) {
-        msgAreaTime = 0;
-        return;
-      }
-
+      if (inviteTriggered || flag('invited') || !flag('memoRead')) { msgAreaTime = 0; return; }
       var cur = Router.current();
       var inMsgArea =
-        cur.page === 'messages' ||
-        cur.page === 'chat' ||
-        cur.page === 'contacts' ||
-        cur.page === 'contact' ||
+        cur.page === 'messages' || cur.page === 'chat' ||
+        cur.page === 'contacts' || cur.page === 'contact' ||
         cur.page === 'friendRequests';
-
-      if (inMsgArea) {
-        msgAreaTime += dt;
-      } else {
-        msgAreaTime = Math.max(0, msgAreaTime - dt * 0.6);
-      }
-
+      if (inMsgArea) msgAreaTime += dt;
+      else msgAreaTime = Math.max(0, msgAreaTime - dt * 0.6);
       if (msgAreaTime > 8000) {
         inviteTriggered = true;
         flag('invited', true);
@@ -484,61 +982,13 @@
     }, 500);
 
     /* ============================================================
-       12. 好友申请通过后：先留空（用户后续再补剧情）
-       ============================================================ */
-    var origHandleAction = window.handleAction;
-    if (typeof origHandleAction === 'function') {
-      window.handleAction = async function (action, el) {
-        if (action === 'fr-accept') {
-          var id = el.dataset.id;
-          var fr = state.db.friendRequests.find(function (x) { return x.id === id; });
-          if (fr && fr.status === 'pending') {
-            fr.status = 'accepted';
-            var c = state.db.contacts.find(function (x) { return x.name === fr.from; });
-            if (c) c.hidden = false;
-            // 临爽的私聊会话
-            if (fr.from === '临爽' && !state.db.chats.ls) {
-              state.db.chats.ls = {
-                id: 'ls', type: 'private', name: '临爽', avatar: '😆',
-                canSend: false, warn: '寒潮期间禁止与校外人员通讯',
-                messages: []
-              };
-            }
-            save();
-            Toast.show('已通过好友申请');
-            // 后续剧情留空（用户尚未写完）
-            render();
-            return;
-          }
-        }
-        return origHandleAction(action, el);
-      };
-    }
-
-    /* ============================================================
-       13. scene9 拦截：确保好友申请通知在"大家都早点睡"之后才弹
-       ============================================================ */
-    var origTriggerStory = window.triggerStory;
-    window.triggerStory = function (id) {
-      if (id === 'scene9') {
-        if (!flag('grp3done')) {
-          console.warn('[story-patch] scene9 被提前调用，已拦截');
-          return;
-        }
-      }
-      return origTriggerStory(id);
-    };
-
-    /* ============================================================
-       14. 补触发：如果补丁加载时玩家已在群聊
+       16. 补触发：如果补丁加载时玩家已在群聊
        ============================================================ */
     setTimeout(function () {
       var cur = Router.current();
-      if (cur.page === 'chat' && cur.params.id === 'by') {
-        onOpenChatPatch('by');
-      }
+      if (cur.page === 'chat' && cur.params.id === 'by') onOpenChatPatch('by');
     }, 800);
 
-    console.log('[story-patch v1.3] 已加载：第6幕群聊2自动续播，好友申请时序确认');
+    console.log('[story-patch v1.4] 已加载：论坛互动 / 头像颜色 / 个人资料 / 消息时序修复');
   });
 })();
