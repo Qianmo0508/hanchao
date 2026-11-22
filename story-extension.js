@@ -1,21 +1,21 @@
 /* ================================================================
-   story-extension.js  v1.0
-   剧情累加文件（与 story-patch.js 并存，本文件专用于"加剧情"）
+   story-extension.js  v1.1
+   剧情累加文件（与 story-patch.js 并存）
 
-   本次新增内容：
-   1. 临爽通过好友后的完整私聊 + 选项 ①/② 分支
-   2. 私聊结束自动触发北苑群 s9
-   3. 群聊 s9 + 选项 ①/② 分支
-   4. 群聊末尾周学姐发【问卷链接】，光标指引点击
-   5. 全新问卷页 PAGES.questionnaire（题目从 1 开始编号，
-      修正原文档 5/10/16 起跳的 bug）
-   6. 选 s9 选项①后自动把"线索：校外人员？"记进备忘录
+   v1.1 修复：
+   1. 临爽私聊消息乱序 —— 改用 ensureMsg 幂等逐条补，
+      已存在的消息跳过且不重复延迟，缺失的按顺序慢速补
+   2. 大群 s9 消息一次铺满 —— 同上，逐条 1.3~1.6 秒间隔播放
+   3. 加 _playingLock 防止同一会话同时启动两次播放
+   4. stage 只在关键节点设置（播放完成 / 选项弹出 / 选项已选）
+   5. onOpenChatPatchExt 检测 _playingLock，避免刷新后重复播放
+   6. 保留 s9 选①自动记录"线索：校外人员？"进备忘录
+   7. 保留问卷页（题目从 1 开始编号，红字/删除线）
 
    如何累加新剧情：
-   - 往 EXT.STAGES 里加阶段
-   - 或在 onOpenChatPatchExt 里加 cid 分支
-   - 或在 CHOICES 里注册新 nodeId
-   - 新页面直接注册 PAGES.xxx
+   - 往 EXT 里加阶段，或新加 `if (cid === 'xxx')` 分支
+   - 新选项：CHOICES.newNode = { a(){}, b(){} }
+   - 新页面：PAGES.newPage = function(){ return { html } }
    ================================================================ */
 (function () {
   'use strict';
@@ -42,7 +42,9 @@
         typeof Toast !== 'undefined' &&
         typeof ConfirmBox !== 'undefined' &&
         typeof sysNow !== 'undefined' &&
-        typeof fmtFull !== 'undefined') {
+        typeof fmtFull !== 'undefined' &&
+        typeof sleep !== 'undefined' &&
+        typeof render !== 'undefined') {
       fn();
     } else {
       setTimeout(function () { ready(fn); }, 80);
@@ -85,7 +87,30 @@
     extEnsure();
 
     /* ============================================================
-       2. 包装 PAGES.chat —— 在原有 mount 后追加剧情钩子
+       2. 幂等消息工具 + 播放锁
+       ============================================================ */
+    var _playingLock = {};
+
+    // 逐条补消息：已存在则跳过；不存在则延迟 delay 后 push
+    async function ensureMsg(cid, msg, delay) {
+      var chat = state.db.chats[cid];
+      if (!chat) return;
+      if (!Array.isArray(chat.messages)) chat.messages = [];
+      var exists = chat.messages.some(function (m) {
+        if (msg.type === 'system') return m.type === 'system' && m.text === msg.text;
+        if (msg.type === 'card') return m.type === 'card' && m.title === msg.title && m.desc === msg.desc;
+        return m.from === msg.from && m.text === msg.text;
+      });
+      if (exists) return;
+      if (delay) await sleep(delay);
+      var m = Object.assign({ id: uid('m'), time: storyTime() }, msg);
+      chat.messages.push(m);
+      save();
+      refreshChat(cid);
+    }
+
+    /* ============================================================
+       3. 包装 PAGES.chat
        ============================================================ */
     var prevChat = PAGES.chat;
     PAGES.chat = function (params) {
@@ -100,7 +125,7 @@
     };
 
     /* ============================================================
-       3. 剧情入口调度
+       4. 剧情调度
        ============================================================ */
     function onOpenChatPatchExt(cid) {
       extEnsure();
@@ -109,219 +134,206 @@
     }
 
     /* ============================================================
-       4. 临爽私聊
+       5. 临爽私聊
+       stage:
+         0 = 未开始
+         1 = 播放中
+         2 = 选项已弹出
+         3 = 选项已选（lsPostChoice 播放中）
+         4 = 私聊部分完成，已触发群聊
        ============================================================ */
     function handleLsChat() {
       if (!flag('ls_added')) return;
+      if (_playingLock['ls']) return;
+
       var stage = flag('ls_stage') || 0;
 
-      // 玩家正在选项流程中，不重复触发
-      if (state.choice && state.choice.chatId === 'ls') return;
-
-      // 阶段 0：首次进入，开播
-      if (stage === 0) {
-        flag('ls_stage', 1);
-        setTimeout(runLinShuangOpening, 600);
+      if (stage === 0 || stage === 1) {
+        playLinShuangOpening();
         return;
       }
 
-      // 阶段 1：选项已弹但玩家刷新 / 未选完 → 补全消息 + 重弹选项
-      if (stage === 1) {
-        var chat = state.db.chats.ls;
-        if (!chat) return;
-        var need = [
-          { type: 'system', text: '你已通过对方的好友申请' },
-          { from: '临爽', text: '特殊期间嘛，有什么事咱俩可以互相照应一下桀桀桀' },
-          { from: '临爽', text: '毕竟你就在我对门' },
-          { from: '临爽', text: '哦对了，真是靠了我得先把你的备注从王晓歌改到陈默…' }
-        ];
-        var changed = false;
-        need.forEach(function (e) {
-          var exists = chat.messages.some(function (m) {
-            if (e.type === 'system') return m.type === 'system' && m.text === e.text;
-            return m.from === e.from && m.text === e.text;
-          });
-          if (!exists) {
-            chat.messages.push(Object.assign({ id: uid('m'), time: storyTime() }, e));
-            changed = true;
-          }
-        });
-        if (changed) save();
+      if (stage === 2) {
+        // 选项已弹，如果 choice 丢了（刷新导致）就重弹
+        if (!(state.choice && state.choice.chatId === 'ls')) {
+          state.choice = {
+            chatId: 'ls', nodeId: 'ls_opening',
+            options: [
+              { k: 'a', label: '①你觉得寒潮这件事…' },
+              { k: 'b', label: '②欢迎来我们寝室玩' }
+            ]
+          };
+          save();
+          render();
+        }
+        return;
+      }
+
+      if (stage === 3) {
+        playLsPostChoice();
+        return;
+      }
+
+      // stage 4：已完成，等待群聊
+    }
+
+    async function playLinShuangOpening() {
+      if (_playingLock['ls']) return;
+      _playingLock['ls'] = true;
+      flag('ls_stage', 1);
+      save();
+      try {
+        var cid = 'ls';
+        await ensureMsg(cid, { type: 'system', text: '你已通过对方的好友申请' }, 600);
+        await ensureMsg(cid, { from: '临爽', text: '特殊期间嘛，有什么事咱俩可以互相照应一下桀桀桀' }, 1400);
+        await ensureMsg(cid, { from: '临爽', text: '毕竟你就在我对门' }, 1600);
+        await ensureMsg(cid, { from: '临爽', text: '哦对了，真是靠了我得先把你的备注从王晓歌改到陈默…' }, 1800);
+        await sleep(900);
+
+        flag('ls_stage', 2);
         state.choice = {
-          chatId: 'ls', nodeId: 'ls_opening',
+          chatId: cid, nodeId: 'ls_opening',
           options: [
             { k: 'a', label: '①你觉得寒潮这件事…' },
             { k: 'b', label: '②欢迎来我们寝室玩' }
           ]
         };
         save();
-        render();
-        return;
+        refreshChat(cid);
+      } finally {
+        _playingLock['ls'] = false;
       }
-
-      // 阶段 2：选项已选，可能 lsPostChoice 没跑完 → 重跑
-      if (stage === 2) {
-        setTimeout(runLsPostChoice, 400);
-        return;
-      }
-    }
-
-    async function runLinShuangOpening() {
-      var cid = 'ls';
-      await sleep(600);
-      pushMsg(cid, { type: 'system', text: '你已通过对方的好友申请', time: storyTime() });
-      refreshChat(cid);
-
-      await themSay(cid, '临爽', '特殊期间嘛，有什么事咱俩可以互相照应一下桀桀桀', 1200);
-      await themSay(cid, '临爽', '毕竟你就在我对门', 1400);
-      await themSay(cid, '临爽', '哦对了，真是靠了我得先把你的备注从王晓歌改到陈默…', 1600);
-      await sleep(900);
-
-      state.choice = {
-        chatId: cid, nodeId: 'ls_opening',
-        options: [
-          { k: 'a', label: '①你觉得寒潮这件事…' },
-          { k: 'b', label: '②欢迎来我们寝室玩' }
-        ]
-      };
-      save();
-      refreshChat(cid);
     }
 
     CHOICES.ls_opening = {
       async a() {
         var cid = 'ls';
         state.choice = null;
-        flag('ls_stage', 2);
+        flag('ls_stage', 3);
         save();
-        await meSay(cid, '话说回来，你觉得有没有觉得寒潮封校这件事很奇怪', 500);
-        await themSay(cid, '临爽', '是吗？小破中老整这种莫名其妙的东西，明明也没有很冷啊', 1600);
-        await runLsPostChoice();
+        try {
+          await ensureMsg(cid, { from: 'me', text: '话说回来，你觉得有没有觉得寒潮封校这件事很奇怪' }, 600);
+          await ensureMsg(cid, { from: '临爽', text: '是吗？小破中老整这种莫名其妙的东西，明明也没有很冷啊' }, 1600);
+          await playLsPostChoice();
+        } catch (e) { console.error(e); }
       },
       async b() {
         var cid = 'ls';
         state.choice = null;
-        flag('ls_stage', 2);
+        flag('ls_stage', 3);
         save();
-        await meSay(cid, '封楼期间欢迎你来412大吃特吃嗷', 500);
-        await meSay(cid, 'VVIP贵宾一位里边儿请～', 800);
-        await themSay(cid, '临爽', '这老板恐怕是邓许吧', 1400);
-        await themSay(cid, '临爽', '你只能算个服务员哈哈哈哈', 1400);
-        await meSay(cid, '我去你的！', 800);
-        addTrust(['临爽'], 3);
-        await sleep(400);
-        pushMsg(cid, { type: 'system', text: trustNote(['临爽'], 3), time: storyTime() });
-        refreshChat(cid);
-        await sleep(600);
-        await runLsPostChoice();
+        try {
+          await ensureMsg(cid, { from: 'me', text: '封楼期间欢迎你来412大吃特吃嗷' }, 600);
+          await ensureMsg(cid, { from: 'me', text: 'VVIP贵宾一位里边儿请～' }, 900);
+          await ensureMsg(cid, { from: '临爽', text: '这老板恐怕是邓许吧' }, 1400);
+          await ensureMsg(cid, { from: '临爽', text: '你只能算个服务员哈哈哈哈' }, 1500);
+          await ensureMsg(cid, { from: 'me', text: '我去你的！' }, 900);
+
+          addTrust(['临爽'], 3);
+          await ensureMsg(cid, { type: 'system', text: trustNote(['临爽'], 3) }, 500);
+          await sleep(500);
+          await playLsPostChoice();
+        } catch (e) { console.error(e); }
       }
     };
 
-    async function runLsPostChoice() {
-      var cid = 'ls';
-      var chat = state.db.chats.ls;
-      if (!chat) return;
-
-      var hasTrigger = chat.messages.some(function (m) {
-        return m.from === '临爽' && m.text === '诶wk，周学姐好像在群里发东西了';
-      });
-
-      if (!hasTrigger) {
-        await themSay(cid, '临爽', '诶wk，周学姐好像在群里发东西了', 1800);
+    async function playLsPostChoice() {
+      if (_playingLock['ls_post']) return;
+      _playingLock['ls_post'] = true;
+      try {
+        var cid = 'ls';
+        await ensureMsg(cid, { from: '临爽', text: '诶wk，周学姐好像在群里发东西了' }, 1800);
+        await sleep(1000);
+        flag('ls_stage', 4);
+        save();
+        triggerS9Group();
+      } finally {
+        _playingLock['ls_post'] = false;
       }
-
-      flag('ls_stage', 3);
-      save();
-
-      await sleep(1200);
-      triggerS9Group();
     }
 
     /* ============================================================
-       5. 北苑群 s9
+       6. 北苑群 s9
+       stage:
+         0 = 未开始
+         1 = runScene9Group 播放中
+         2 = 选项已弹
+         3 = 选项已选（s9PostChoice 播放中）
+         4 = 问卷链接已发
        ============================================================ */
     function handleByChatExt() {
       if (!flag('s9_pending')) return;
-      if (state.choice && state.choice.chatId === 'by') return;
+      if (_playingLock['by_s9'] || _playingLock['by_s9_post']) return;
 
       var stage = flag('s9_stage') || 0;
 
-      if (stage === 0) {
-        flag('s9_stage', 1);
-        setTimeout(runScene9Group, 900);
+      if (stage === 0 || stage === 1) {
+        playS9Group();
         return;
       }
 
-      if (stage === 1) {
-        // 补全 s9 群消息 + 重弹选项
-        ensureS9Stage1Msgs();
+      if (stage === 2) {
+        if (!(state.choice && state.choice.chatId === 'by')) {
+          state.choice = {
+            chatId: 'by', nodeId: 'grp_s9',
+            options: [
+              { k: 'a', label: '①你不留校怎么还进留校群' },
+              { k: 'b', label: '②羡慕你，受不了这个规则了' }
+            ]
+          };
+          save();
+          render();
+        }
+        return;
+      }
+
+      if (stage === 3) {
+        playS9PostChoice();
+        return;
+      }
+
+      if (stage === 4) {
+        // 问卷链接已发，显示光标指引
+        setTimeout(function () {
+          CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
+        }, 500);
+      }
+    }
+
+    async function playS9Group() {
+      if (_playingLock['by_s9']) return;
+      _playingLock['by_s9'] = true;
+      flag('s9_stage', 1);
+      save();
+      try {
+        var cid = 'by';
+        await ensureMsg(cid, { from: '周学姐', text: '你们对这次"寒潮预警"有什么想法么……？' }, 1400);
+        await ensureMsg(cid, { from: '许双荞', text: '怪怪的，现在才五月份啊' }, 1600);
+        await ensureMsg(cid, { from: '临爽', text: '？我靠你不说我都忘了，现在是5月啊！！哪门子的寒潮我问你' }, 1600);
+        await ensureMsg(cid, { from: '苏青', text: '五月飞雪，好一出窦娥冤～' }, 1600);
+        await ensureMsg(cid, { from: '张夏夏', text: '我早就感觉奇怪了，还好提前撤离了……还是在家舒服啊！' }, 1600);
+        await sleep(900);
+
+        flag('s9_stage', 2);
         state.choice = {
-          chatId: 'by', nodeId: 'grp_s9',
+          chatId: cid, nodeId: 'grp_s9',
           options: [
             { k: 'a', label: '①你不留校怎么还进留校群' },
             { k: 'b', label: '②羡慕你，受不了这个规则了' }
           ]
         };
         save();
-        render();
-        return;
+        refreshChat(cid);
+      } finally {
+        _playingLock['by_s9'] = false;
       }
-
-      if (stage === 3 || stage === 4) {
-        // 问卷链接已发，显示光标指引（若玩家此刻在群聊页面）
-        setTimeout(function () {
-          CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
-        }, 500);
-        return;
-      }
-    }
-
-    async function runScene9Group() {
-      var cid = 'by';
-      await themSay(cid, '周学姐', '你们对这次"寒潮预警"有什么想法么……？', 1200);
-      await themSay(cid, '许双荞', '怪怪的，现在才五月份啊', 1600);
-      await themSay(cid, '临爽', '？我靠你不说我都忘了，现在是5月啊！！哪门子的寒潮我问你', 1600);
-      await themSay(cid, '苏青', '五月飞雪，好一出窦娥冤～', 1600);
-      await themSay(cid, '张夏夏', '我早就感觉奇怪了，还好提前撤离了……还是在家舒服啊！', 1600);
-      await sleep(900);
-
-      state.choice = {
-        chatId: cid, nodeId: 'grp_s9',
-        options: [
-          { k: 'a', label: '①你不留校怎么还进留校群' },
-          { k: 'b', label: '②羡慕你，受不了这个规则了' }
-        ]
-      };
-      flag('s9_stage', 1);
-      save();
-      refreshChat(cid);
-    }
-
-    function ensureS9Stage1Msgs() {
-      var chat = state.db.chats.by;
-      if (!chat) return;
-      var need = [
-        { from: '周学姐', text: '你们对这次"寒潮预警"有什么想法么……？' },
-        { from: '许双荞', text: '怪怪的，现在才五月份啊' },
-        { from: '临爽', text: '？我靠你不说我都忘了，现在是5月啊！！哪门子的寒潮我问你' },
-        { from: '苏青', text: '五月飞雪，好一出窦娥冤～' },
-        { from: '张夏夏', text: '我早就感觉奇怪了，还好提前撤离了……还是在家舒服啊！' }
-      ];
-      var changed = false;
-      need.forEach(function (e) {
-        var exists = chat.messages.some(function (m) { return m.from === e.from && m.text === e.text; });
-        if (!exists) {
-          chat.messages.push({ id: uid('m'), from: e.from, text: e.text, time: storyTime() });
-          changed = true;
-        }
-      });
-      if (changed) save();
     }
 
     function triggerS9Group() {
       if (flag('s9_notified')) return;
       flag('s9_notified', true);
       flag('s9_pending', true);
+      flag('s9_stage', 0);
 
       var byChat = state.db.chats.by;
       if (byChat && !byChat.messages.some(function (m) {
@@ -344,7 +356,8 @@
 
       var cur = Router.current();
       if (cur.page === 'chat' && cur.params.id === 'by') {
-        onOpenChatPatchExt('by');
+        // 已在群聊，立即开始播放
+        setTimeout(function () { onOpenChatPatchExt('by'); }, 300);
       }
     }
 
@@ -352,93 +365,98 @@
       async a() {
         var cid = 'by';
         state.choice = null;
-        flag('s9_stage', 2);
+        flag('s9_stage', 3);
         save();
-        await meSay(cid, '这个张夏夏，都不留校怎么还在留校群里苟着啊！', 500);
-        await themSay(cid, '张夏夏', '一线吃瓜～', 1400);
-        await themSay(cid, '周学姐', '我拉的，因为貌似她只能通过这个群和我们联系。', 1600);
-        await themSay(cid, '临爽', '挖什么金矿', 1400);
-        await themSay(cid, '张夏夏', '是这样的…封校那天我发现我联系不上你们任何一个人，直到看到论坛里有这个群的链接，我才好歹能和你们说上话！', 1800);
-        await themSay(cid, '张夏夏', '我似乎是一出校就被识别为"校外人员"了……总之珍惜吧！', 1600);
-        await themSay(cid, '苏青', '确实呢，我现在一想和校外的朋友联系就会弹出一个警告', 1600);
-        await themSay(cid, '沈敏', '对，好像是什么"寒潮期间禁止与校外人员通讯"，弱智极了', 1600);
-        await meSay(cid, '这不是把我们大家都囚禁在渠中了吗……切断一切外界联系', 800);
-        await themSay(cid, '邓许', '寒潮真的至于这样吗？我不敢苟同', 1600);
-        addMemoClue();
-        await sleep(400);
-        pushMsg(cid, { type: 'system', text: '［"线索：校外人员？"已自动记录进备忘录］', time: storyTime() });
-        refreshChat(cid);
-        await sleep(600);
-        await s9PostChoice();
+        try {
+          await ensureMsg(cid, { from: 'me', text: '这个张夏夏，都不留校怎么还在留校群里苟着啊！' }, 600);
+          await ensureMsg(cid, { from: '张夏夏', text: '一线吃瓜～' }, 1400);
+          await ensureMsg(cid, { from: '周学姐', text: '我拉的，因为貌似她只能通过这个群和我们联系。' }, 1600);
+          await ensureMsg(cid, { from: '临爽', text: '挖什么金矿' }, 1400);
+          await ensureMsg(cid, { from: '张夏夏', text: '是这样的…封校那天我发现我联系不上你们任何一个人，直到看到论坛里有这个群的链接，我才好歹能和你们说上话！' }, 1800);
+          await ensureMsg(cid, { from: '张夏夏', text: '我似乎是一出校就被识别为"校外人员"了……总之珍惜吧！' }, 1600);
+          await ensureMsg(cid, { from: '苏青', text: '确实呢，我现在一想和校外的朋友联系就会弹出一个警告' }, 1600);
+          await ensureMsg(cid, { from: '沈敏', text: '对，好像是什么"寒潮期间禁止与校外人员通讯"，弱智极了' }, 1600);
+          await ensureMsg(cid, { from: 'me', text: '这不是把我们大家都囚禁在渠中了吗……切断一切外界联系' }, 800);
+          await ensureMsg(cid, { from: '邓许', text: '寒潮真的至于这样吗？我不敢苟同' }, 1600);
+
+          addMemoClue();
+          await ensureMsg(cid, { type: 'system', text: '［"线索：校外人员？"已自动记录进备忘录］' }, 600);
+          await sleep(700);
+          await playS9PostChoice();
+        } catch (e) { console.error(e); }
       },
       async b() {
         var cid = 'by';
         state.choice = null;
-        flag('s9_stage', 2);
+        flag('s9_stage', 3);
         save();
-        await meSay(cid, '真羡慕你啊……', 500);
-        await meSay(cid, '我是真受不了这个雷霆规则了！', 800);
-        await themSay(cid, '沈敏', '是啊，根本不是给人用的', 1400);
-        await themSay(cid, '临爽', 'md真的太痛苦了，我们完全就是被囚禁圈养在渠中的牲畜啊！', 1600);
-        await themSay(cid, '周学姐', '没有"们"。。。你自己是牲畜就够了。', 1600);
-        await themSay(cid, '临爽', '？', 1200);
-        await themSay(cid, '苏青', '太无聊了，姐姐我实在很想去7号楼找你们玩哦，奈何学校不让', 1600);
-        await themSay(cid, '苏青', '我也很无奈～', 1400);
-        await themSay(cid, '许双荞', '，，似乎你刚说了懒得出校门', 1600);
-        await themSay(cid, '张夏夏', '哈哈哈我看到你们转发的规则了……哎不是感觉怎么看都怪怪的啊但是', 1600);
-        addTrust(['沈敏', '临爽'], 1);
-        await sleep(400);
-        pushMsg(cid, { type: 'system', text: trustNote(['沈敏', '临爽'], 1), time: storyTime() });
-        refreshChat(cid);
-        await sleep(600);
-        await s9PostChoice();
+        try {
+          await ensureMsg(cid, { from: 'me', text: '真羡慕你啊……' }, 600);
+          await ensureMsg(cid, { from: 'me', text: '我是真受不了这个雷霆规则了！' }, 900);
+          await ensureMsg(cid, { from: '沈敏', text: '是啊，根本不是给人用的' }, 1400);
+          await ensureMsg(cid, { from: '临爽', text: 'md真的太痛苦了，我们完全就是被囚禁圈养在渠中的牲畜啊！' }, 1600);
+          await ensureMsg(cid, { from: '周学姐', text: '没有"们"。。。你自己是牲畜就够了。' }, 1600);
+          await ensureMsg(cid, { from: '临爽', text: '？' }, 1200);
+          await ensureMsg(cid, { from: '苏青', text: '太无聊了，姐姐我实在很想去7号楼找你们玩哦，奈何学校不让' }, 1600);
+          await ensureMsg(cid, { from: '苏青', text: '我也很无奈～' }, 1400);
+          await ensureMsg(cid, { from: '许双荞', text: '，，似乎你刚说了懒得出校门' }, 1600);
+          await ensureMsg(cid, { from: '张夏夏', text: '哈哈哈我看到你们转发的规则了……哎不是感觉怎么看都怪怪的啊但是' }, 1600);
+
+          addTrust(['沈敏', '临爽'], 1);
+          await ensureMsg(cid, { type: 'system', text: trustNote(['沈敏', '临爽'], 1) }, 600);
+          await sleep(700);
+          await playS9PostChoice();
+        } catch (e) { console.error(e); }
       }
     };
 
-    async function s9PostChoice() {
-      var cid = 'by';
-      var chat = state.db.chats.by;
-      if (!chat) return;
-
-      // 已发过问卷链接 → 只补光标，不重推
-      var hasLink = chat.messages.some(function (m) {
-        return m.from === '周学姐' && m.text === '【问卷链接】';
-      });
-
-      if (!hasLink) {
-        await themSay(cid, '周学姐', '嗯，别的不敢多说，这也是我来找大家的目的。', 1600);
-        await themSay(cid, '周学姐', '北苑的同学们，麻烦大家配合一下，填写以下问卷，我会反馈这一切的蹊跷。', 1800);
-        await themSay(cid, '临爽', '啊靠——都这时候了还要填excel，不要啊！！！（震声', 1600);
-        await themSay(cid, '周学姐', '哈哈别急，除了excel还有你们最爱的ddl', 1600);
-        await themSay(cid, '周学姐', '请大家在今晚前提交给我。', 1400);
-        await themSay(cid, '张夏夏', '我、我也要交吗？', 1400);
-        await themSay(cid, '周学姐', '。。你不用', 1200);
+    async function playS9PostChoice() {
+      if (_playingLock['by_s9_post']) return;
+      _playingLock['by_s9_post'] = true;
+      try {
+        var cid = 'by';
+        await ensureMsg(cid, { from: '周学姐', text: '嗯，别的不敢多说，这也是我来找大家的目的。' }, 1600);
+        await ensureMsg(cid, { from: '周学姐', text: '北苑的同学们，麻烦大家配合一下，填写以下问卷，我会反馈这一切的蹊跷。' }, 1800);
+        await ensureMsg(cid, { from: '临爽', text: '啊靠——都这时候了还要填excel，不要啊！！！（震声' }, 1600);
+        await ensureMsg(cid, { from: '周学姐', text: '哈哈别急，除了excel还有你们最爱的ddl' }, 1600);
+        await ensureMsg(cid, { from: '周学姐', text: '请大家在今晚前提交给我。' }, 1400);
+        await ensureMsg(cid, { from: '张夏夏', text: '我、我也要交吗？' }, 1400);
+        await ensureMsg(cid, { from: '周学姐', text: '。。你不用' }, 1200);
         await sleep(800);
 
-        pushMsg(cid, {
-          from: '周学姐',
-          text: '【问卷链接】',
-          time: storyTime(),
-          link: { text: '【问卷链接】', page: 'questionnaire', params: {} }
+        // 问卷链接（带跳转）
+        var hasLink = state.db.chats.by.messages.some(function (m) {
+          return m.from === '周学姐' && m.text === '【问卷链接】';
         });
-        refreshChat(cid);
+        if (!hasLink) {
+          state.db.chats.by.messages.push({
+            id: uid('m'), from: '周学姐',
+            text: '【问卷链接】',
+            time: storyTime(),
+            link: { text: '【问卷链接】', page: 'questionnaire', params: {} }
+          });
+          save();
+          refreshChat(cid);
+        }
 
-        await themSay(cid, '许双荞', '周学姐，这个问卷的提交处好像不是你啊', 1600);
-        await themSay(cid, '邓许', '好像，还真是……', 1600);
+        await ensureMsg(cid, { from: '许双荞', text: '周学姐，这个问卷的提交处好像不是你啊' }, 1600);
+        await ensureMsg(cid, { from: '邓许', text: '好像，还真是……' }, 1600);
+
+        flag('s9_stage', 4);
+        save();
+
+        await sleep(1200);
+        var body = document.querySelector('#chat-body');
+        if (body) body.scrollTop = body.scrollHeight;
+        await sleep(500);
+        CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
+      } finally {
+        _playingLock['by_s9_post'] = false;
       }
-
-      flag('s9_stage', 3);
-      save();
-
-      await sleep(1200);
-      var body = document.querySelector('#chat-body');
-      if (body) body.scrollTop = body.scrollHeight;
-      await sleep(500);
-      CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
     }
 
     /* ============================================================
-       6. 备忘录线索
+       7. 备忘录线索
        ============================================================ */
     function addMemoClue() {
       extEnsure();
@@ -455,7 +473,7 @@
     }
 
     /* ============================================================
-       7. 问卷数据（题目编号从 1 开始，修正跳号）
+       8. 问卷数据（题目从 1 开始编号）
        ============================================================ */
     var Q_DATA = {
       title: '渠京第一中学寒潮预警与宿舍管理规定调查问卷',
@@ -559,13 +577,12 @@
     };
 
     /* ============================================================
-       8. 问卷页面
+       9. 问卷页面
        ============================================================ */
     function renderQuestion(q, answers) {
       var n = q.n;
       var cur = answers['q' + n];
       var titleHtml = esc(q.text);
-      // 处理 {red:xxx}
       titleHtml = titleHtml.replace(/\{red:([^}]+)\}/g, '<span class="q-red">$1</span>');
 
       var html = '<div class="q-block">';
@@ -575,12 +592,11 @@
         q.options.forEach(function (opt) {
           var display = typeof opt === 'string' ? opt : opt.text;
           var strike = typeof opt === 'object' && opt.strike;
-          var val = esc(display);
           var checked = (cur === display) ? 'checked' : '';
-          var style = strike ? 'style="color:var(--c-danger);text-decoration:line-through;"' : '';
+          var style = strike ? ' style="color:var(--c-danger);text-decoration:line-through;"' : '';
           html += '<label class="q-label">' +
-            '<input type="radio" name="q' + n + '" value="' + val + '" ' + checked + '>' +
-            '<span ' + style + '>' + esc(display) + '</span>' +
+            '<input type="radio" name="q' + n + '" value="' + esc(display) + '" ' + checked + '>' +
+            '<span' + style + '>' + esc(display) + '</span>' +
           '</label>';
         });
         if (q.type === 'single-other') {
@@ -656,20 +672,16 @@
         '</div>',
         mount: function () {
           if (submitted) {
-            // 只读视图：禁用所有输入
-            var body2 = document.querySelector('.page-body');
-            if (body2) {
-              body2.querySelectorAll('input, textarea, button[data-action="submit-questionnaire"]').forEach(function (el) {
-                el.disabled = true;
-              });
-            }
+            document.querySelectorAll('.page-body input, .page-body textarea').forEach(function (el) {
+              el.disabled = true;
+            });
           }
         }
       };
     };
 
     /* ============================================================
-       9. 提交问卷
+       10. 提交问卷
        ============================================================ */
     function collectQuestionnaire() {
       var answers = {};
@@ -680,8 +692,7 @@
           var v = el.value;
           if (v === '__other') {
             var other = document.querySelector('.q-other-input[data-q="' + el.name.replace('q', '') + '"]');
-            if (other && other.value.trim()) v = '其他：' + other.value.trim();
-            else v = '其他';
+            v = (other && other.value.trim()) ? '其他：' + other.value.trim() : '其他';
           }
           answers[qn] = v;
         } else if (el.type === 'checkbox' && el.checked) {
@@ -690,13 +701,11 @@
           var v2 = el.value;
           if (v2 === '__other') {
             var other2 = document.querySelector('.q-other-input[data-q="' + el.name.replace('q', '') + '"]');
-            if (other2 && other2.value.trim()) v2 = '其他：' + other2.value.trim();
-            else v2 = '其他';
+            v2 = (other2 && other2.value.trim()) ? '其他：' + other2.value.trim() : '其他';
           }
           answers[qn2].push(v2);
         } else if (el.classList.contains('q-text') || el.classList.contains('q-textarea')) {
-          var qn3 = 'q' + el.dataset.q;
-          answers[qn3] = el.value;
+          answers['q' + el.dataset.q] = el.value;
         }
       });
       return answers;
@@ -719,10 +728,7 @@
       save();
 
       Toast.show('问卷已提交');
-      // 后续剧情待续写（用户尚未更新）
-      setTimeout(function () {
-        render();
-      }, 300);
+      setTimeout(function () { render(); }, 300);
     }
 
     document.addEventListener('click', function (e) {
@@ -733,37 +739,33 @@
     }, true);
 
     /* ============================================================
-       10. 事件委托：其他输入框选中后自动选中"其他"
+       11. 输入"其他"时自动选中对应 radio / checkbox
        ============================================================ */
     document.addEventListener('input', function (e) {
       var el = e.target;
       if (!el.classList || !el.classList.contains('q-other-input')) return;
       var q = el.dataset.q;
-      // 找同组"其他"radio/checkbox
-      var other = document.querySelector('input[type=radio][name="q' + q + '"][value="__other"], input[type=checkbox][name="q' + q + '"][value="__other"]');
-      if (other && !other.disabled) {
-        if (el.value.trim()) other.checked = true;
-      }
+      var other = document.querySelector(
+        'input[type=radio][name="q' + q + '"][value="__other"], ' +
+        'input[type=checkbox][name="q' + q + '"][value="__other"]'
+      );
+      if (other && !other.disabled && el.value.trim()) other.checked = true;
     });
 
     /* ============================================================
-       11. Router.push 钩子：处理问卷页
+       12. Router.push 钩子
        ============================================================ */
     var prevPush = Router.push.bind(Router);
     Router.push = function (page, params) {
       extEnsure();
       if (page === 'questionnaire') {
         CursorGuide.hide();
-        if (flag('s9_stage') === 3) {
-          flag('s9_stage', 4);
-          save();
-        }
       }
       prevPush(page, params);
     };
 
     /* ============================================================
-       12. 补触发：如果补丁加载时玩家在 ls / by 群
+       13. 补触发：如果加载时玩家正在 ls / by 页面
        ============================================================ */
     setTimeout(function () {
       extEnsure();
@@ -774,20 +776,22 @@
     }, 900);
 
     /* ============================================================
-       13. 暴露扩展 API（供未来剧情继续累加）
+       14. 暴露扩展 API
        ============================================================ */
     window.StoryExtension = {
       addMemoClue: addMemoClue,
-      runLinShuangOpening: runLinShuangOpening,
-      runLsPostChoice: runLsPostChoice,
+      playLinShuangOpening: playLinShuangOpening,
+      playLsPostChoice: playLsPostChoice,
       triggerS9Group: triggerS9Group,
-      runScene9Group: runScene9Group,
-      s9PostChoice: s9PostChoice,
+      playS9Group: playS9Group,
+      playS9PostChoice: playS9PostChoice,
       renderQuestion: renderQuestion,
       Q_DATA: Q_DATA,
-      CHOICES: CHOICES
+      CHOICES: CHOICES,
+      ensureMsg: ensureMsg,
+      _playingLock: _playingLock
     };
 
-    console.log('[story-extension v1.0] 已加载：临爽私聊 / s9 群聊 / 问卷');
+    console.log('[story-extension v1.1] 已加载：幂等逐条播放，修复乱序与一次铺满');
   });
 })();
