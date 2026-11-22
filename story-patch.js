@@ -1,11 +1,19 @@
 /* ================================================================
-   story-patch.js  v1.6
-   v1.6 修复（在 v1.5 基础上）：
-   1. 【新增】首次进入默认关闭"通知抖动"伪 bug（bugNotify = false）；
-      开发者面板仍可手动开启。老存档通过 patchDefaults.bugNotifyOff
-      标记一次性迁移，避免每次刷新都覆盖用户手动设置。
-   2. 保留 v1.5 全部修复（forumLikes 崩溃兜底、每页 12 App、
-      好友申请时序、预推消息、论坛互动、头像颜色、个人资料等）。
+   story-patch.js  v1.7
+   v1.7 新增 / 修复（在 v1.6 基础上）：
+   1. 【锁屏解锁兼容性】重写 PAGES.lock 的 mount：
+      - 同时绑定 touchstart/touchmove/touchend 与 pointerdown/pointerup
+      - 滑动阈值降到 30px，横向容差 100px
+      - 点击兜底：点底部"上滑解锁"提示 / 手写区 / 顶部时间区 也能进密码
+      - 桌面端点击任意空白处直接进密码
+   2. 【头像颜色】avatarColor 改用 Array.from + codePointAt，
+      彻底修复不同 emoji 落到同一紫色的问题；
+      个人资料页新增"头像底色"选择器（12 色 + 默认），
+      自己发的消息头像 / 设置页头像使用自定义色。
+   3. 【消息频率】新增 themSayP 包装，所有剧情对话延迟 ×1.3，
+      稍微放慢节奏，方便看清。
+   4. 保留 v1.6 全部修复（forumLikes 崩溃兜底、每页 12 App、
+      好友申请时序、预推消息、论坛互动、个人资料、默认关通知抖动）。
    放置位置：主 HTML </body> 之前，独立文件 story-patch.js
    ================================================================ */
 (function () {
@@ -47,12 +55,15 @@
       '.post-like-btn{background:none;border:none;font-size:var(--fs-xs);color:var(--c-text-3);padding:2px 8px;border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;gap:3px}' +
       '.post-like-btn.liked{color:var(--c-accent)}' +
       '.profile-avatar-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}' +
-      '.profile-avatar-opt{width:52px;height:52px;border-radius:14px;border:2px solid transparent;background:var(--c-card-2);font-size:26px;display:flex;align-items:center;justify-content:center;cursor:pointer}' +
-      '.profile-avatar-opt.on{border-color:var(--c-accent)}';
+      '.profile-avatar-opt{width:52px;height:52px;border-radius:14px;border:2px solid transparent;background:var(--c-card-2);font-size:26px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.3)}' +
+      '.profile-avatar-opt.on{border-color:var(--c-accent);box-shadow:0 0 0 2px var(--c-accent-soft)}' +
+      '.profile-color-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}' +
+      '.profile-color-opt{width:40px;height:40px;border-radius:12px;border:2px solid transparent;cursor:pointer;padding:0;font-size:10px;font-weight:600;color:#fff;display:flex;align-items:center;justify-content:center;text-shadow:0 1px 2px rgba(0,0,0,.4)}' +
+      '.profile-color-opt.on{border-color:var(--c-accent);box-shadow:0 0 0 2px var(--c-accent-soft)}';
     document.head.appendChild(st);
 
     /* ============================================================
-       1. 头像颜色
+       1. 头像颜色工具（v1.7：用 Array.from + codePointAt 支持 emoji）
        ============================================================ */
     var PALETTE = [
       '#5B8FF9', '#F6903D', '#F6BD16', '#7262FD',
@@ -62,7 +73,10 @@
     function avatarColor(name) {
       if (!name) return PALETTE[0];
       var h = 5381;
-      for (var i = 0; i < name.length; i++) h = ((h << 5) + h) + name.charCodeAt(i);
+      var chars = Array.from(String(name));
+      for (var i = 0; i < chars.length; i++) {
+        h = ((h << 5) + h) + chars[i].codePointAt(0);
+      }
       h = h >>> 0;
       return PALETTE[h % PALETTE.length];
     }
@@ -75,13 +89,21 @@
       ensureStateFields();
       return (state.profile && state.profile.name) || '陈默';
     }
+    // v1.7：自己的头像优先使用自定义底色
+    function myAvatarStyle() {
+      ensureStateFields();
+      var c = state.profile && state.profile.color;
+      if (c && c !== 'default') return 'background:' + c + ';';
+      return avatarStyle(profileAvatar());
+    }
 
     /* ============================================================
        2. 状态字段兜底
        ============================================================ */
     function ensureStateFields() {
       if (!state) return;
-      if (!state.profile) state.profile = { name: '陈默', avatar: '🫥' };
+      if (!state.profile) state.profile = { name: '陈默', avatar: '🫥', color: 'default' };
+      if (state.profile.color === undefined) state.profile.color = 'default';
       if (!state.forumLikes) state.forumLikes = {};
       if (!state.forumReplies) state.forumReplies = {};
       if (!state.flags) state.flags = {};
@@ -91,15 +113,21 @@
     ensureStateFields();
 
     /* ============================================================
-       2.1 【v1.6 新增】默认关闭"通知抖动"伪 bug
-           只执行一次，用 patchDefaults.bugNotifyOff 标记，
-           避免每次刷新都覆盖开发者在面板里手动开启的设置。
+       2.1 默认关闭"通知抖动"伪 bug（一次性）
        ============================================================ */
     if (!state.patchDefaults) state.patchDefaults = {};
     if (!state.patchDefaults.bugNotifyOff) {
       state.settings.bugNotify = false;
       state.patchDefaults.bugNotifyOff = true;
       save();
+    }
+
+    /* ============================================================
+       2.2 v1.7：消息延迟工具（×1.3）
+       ============================================================ */
+    var MSG_SPEED = 1.3;
+    async function themSayP(cid, name, text, delay) {
+      return themSay(cid, name, text, Math.round((delay || 1500) * MSG_SPEED));
     }
 
     /* ============================================================
@@ -263,7 +291,104 @@
     };
 
     /* ============================================================
-       5. PAGES.chat
+       5. PAGES.lock —— v1.7 重写 mount：滑动/点击 双兜底
+       ============================================================ */
+    var origLock = PAGES.lock;
+    PAGES.lock = function () {
+      var def = origLock();
+      def.mount = function (root) {
+        var page = root.querySelector('#lock-page');
+        if (!page) return;
+
+        var unlocked = false;
+        var openPin = function () {
+          if (unlocked) return;
+          unlocked = true;
+          if (typeof showPin === 'function') {
+            try { showPin(root); } catch (e) { console.error(e); }
+          }
+        };
+
+        var startX = 0, startY = 0, tracking = false;
+        var lastTouchEnd = 0;
+
+        var onStart = function (x, y, target) {
+          if (target && target.closest && target.closest('.lock-notif')) return;
+          startX = x; startY = y; tracking = true;
+        };
+        var onMove = function (x, y, evt) {
+          if (!tracking) return;
+          var dy = startY - y;
+          if (dy > 10 && evt && evt.cancelable) {
+            try { evt.preventDefault(); } catch (e) {}
+          }
+        };
+        var onEnd = function (x, y) {
+          if (!tracking) return;
+          tracking = false;
+          var dy = startY - y;
+          var dx = Math.abs(x - startX);
+          // v1.7：阈值降低到 30px，横向容差 100px
+          if (dy > 30 && dx < 100) openPin();
+        };
+
+        // ---- 触摸事件（移动端优先） ----
+        page.addEventListener('touchstart', function (e) {
+          if (e.touches.length !== 1) return;
+          onStart(e.touches[0].clientX, e.touches[0].clientY, e.target);
+        }, { passive: true });
+
+        page.addEventListener('touchmove', function (e) {
+          if (e.touches.length !== 1) return;
+          onMove(e.touches[0].clientX, e.touches[0].clientY, e);
+        }, { passive: false });
+
+        page.addEventListener('touchend', function (e) {
+          if (e.changedTouches.length !== 1) return;
+          lastTouchEnd = Date.now();
+          onEnd(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+        }, { passive: true });
+
+        page.addEventListener('touchcancel', function () {
+          tracking = false;
+        }, { passive: true });
+
+        // ---- 指针事件（桌面 / 非触摸） ----
+        page.addEventListener('pointerdown', function (e) {
+          if (e.pointerType === 'touch') return;
+          if (Date.now() - lastTouchEnd < 500) return;
+          onStart(e.clientX, e.clientY, e.target);
+        });
+        page.addEventListener('pointerup', function (e) {
+          if (e.pointerType === 'touch') return;
+          if (Date.now() - lastTouchEnd < 500) return;
+          onEnd(e.clientX, e.clientY);
+        });
+        page.addEventListener('pointercancel', function () {
+          tracking = false;
+        });
+
+        // ---- 点击兜底 ----
+        page.addEventListener('click', function (e) {
+          if (e.target.closest('.lock-notif')) return;
+          // 桌面端：点任意空白处直接进密码
+          if (window.matchMedia('(pointer:fine)').matches) {
+            openPin();
+            return;
+          }
+          // 移动端：点底部提示 / 手写区 / 顶部时间区 也能进密码
+          if (e.target.closest('.lock-bottom') ||
+              e.target.closest('.lock-handwrite') ||
+              e.target.closest('.lock-top')) {
+            openPin();
+          }
+        });
+      };
+      return def;
+    };
+
+    /* ============================================================
+       6. PAGES.chat
        ============================================================ */
     PAGES.chat = function (params) {
       ensureStateFields();
@@ -304,8 +429,10 @@
         }
         var avKey = isMe ? profileName() : (chat.type === 'group' ? (m.from || '?') : chat.name);
         var avEmoji = isMe ? profileAvatar() : (chat.type === 'group' ? (m.from || '?').slice(0, 1) : chat.avatar);
+        // v1.7：自己发的消息头像使用自定义底色
+        var avStyle = isMe ? myAvatarStyle() : avatarStyle(avKey);
         msgsHtml += '<div class="msg ' + (isMe ? 'me' : '') + '">' +
-          '<div class="msg-av" style="' + avatarStyle(avKey) + '">' + avEmoji + '</div>' +
+          '<div class="msg-av" style="' + avStyle + '">' + avEmoji + '</div>' +
           '<div class="msg-wrap">' +
             (showName ? '<div class="msg-name">' + esc(m.from) + '</div>' : '') +
             '<div class="bubble">' + textHtml + '</div>' +
@@ -351,7 +478,7 @@
     };
 
     /* ============================================================
-       6. onOpenChatPatch + 剧情续播
+       7. onOpenChatPatch + 剧情续播
        ============================================================ */
     function onOpenChatPatch(cid) {
       if (cid !== 'by') return;
@@ -390,11 +517,11 @@
 
     async function runGroup1Patch() {
       var cid = 'by';
-      await themSay(cid, '沈敏', '这不是412的？王晓歌？', 1400);
-      await themSay(cid, '沈敏', '卧槽你们拉她干嘛啊！？', 1700);
-      await themSay(cid, '临爽', '？什么，详细说来👂🏻', 1700);
-      await themSay(cid, '沈敏', '也没什么…就，你自己看看论坛', 1700);
-      await sleep(1500);
+      await themSayP(cid, '沈敏', '这不是412的？王晓歌？', 1400);
+      await themSayP(cid, '沈敏', '卧槽你们拉她干嘛啊！？', 1700);
+      await themSayP(cid, '临爽', '？什么，详细说来👂🏻', 1700);
+      await themSayP(cid, '沈敏', '也没什么…就，你自己看看论坛', 1700);
+      await sleep(1800);
       if (!flag('forumGuided')) {
         flag('forumGuided', true);
         Router.root('home');
@@ -404,9 +531,9 @@
 
     async function runGroup2Patch() {
       var cid = 'by';
-      await themSay(cid, '许双荞', '群主是周学姐吗？', 1600);
-      await themSay(cid, '沈敏', '@周学姐 学姐拉她干嘛啊啊别来索我命我什么都没干', 1600);
-      await sleep(700);
+      await themSayP(cid, '许双荞', '群主是周学姐吗？', 1600);
+      await themSayP(cid, '沈敏', '@周学姐 学姐拉她干嘛啊啊别来索我命我什么都没干', 1600);
+      await sleep(900);
       state.choice = {
         chatId: cid, nodeId: 'grp1',
         options: [
@@ -420,14 +547,14 @@
 
     async function runScene8MsgsPatch() {
       var cid = 'by';
-      await themSay(cid, '沈敏', '看到了，这也太苛刻了吧？！', 1400);
-      await themSay(cid, '临爽', '才特么6点就不让出楼…是人吗…', 1600);
-      await themSay(cid, '许双荞', '现在貌似已经六点了', 1600);
-      await themSay(cid, '周学姐', '@所有人 现在开始所有人不要出楼！', 1600);
-      await themSay(cid, '邓许', '我倒是有个疑问啊……', 1600);
-      await themSay(cid, '邓许', '寒潮是寒潮，出个宿舍楼和“人身安全”有什么关系？', 1600);
-      await themSay(cid, '邓许', '又和固定的时间有什么关系？', 1600);
-      await themSay(cid, '沈敏', '说的对啊……顶多被冻着，可这应该算健康问题，怎么能算人身安全', 1600);
+      await themSayP(cid, '沈敏', '看到了，这也太苛刻了吧？！', 1400);
+      await themSayP(cid, '临爽', '才特么6点就不让出楼…是人吗…', 1600);
+      await themSayP(cid, '许双荞', '现在貌似已经六点了', 1600);
+      await themSayP(cid, '周学姐', '@所有人 现在开始所有人不要出楼！', 1600);
+      await themSayP(cid, '邓许', '我倒是有个疑问啊……', 1600);
+      await themSayP(cid, '邓许', '寒潮是寒潮，出个宿舍楼和“人身安全”有什么关系？', 1600);
+      await themSayP(cid, '邓许', '又和固定的时间有什么关系？', 1600);
+      await themSayP(cid, '沈敏', '说的对啊……顶多被冻着，可这应该算健康问题，怎么能算人身安全', 1600);
       state.choice = {
         chatId: cid, nodeId: 'grp3',
         options: [
@@ -440,7 +567,7 @@
     }
 
     /* ============================================================
-       7. PAGES.memoDetail —— 打字完成后触发消息引导
+       8. PAGES.memoDetail —— 打字完成后触发消息引导
        ============================================================ */
     var origMemoDetail = PAGES.memoDetail;
     PAGES.memoDetail = function (params) {
@@ -467,7 +594,7 @@
     };
 
     /* ============================================================
-       8. PAGES.forumPost —— 楼层点赞/回复 + 滚动触发通知
+       9. PAGES.forumPost —— 楼层点赞/回复 + 滚动触发通知
        ============================================================ */
     PAGES.forumPost = function (params) {
       ensureStateFields();
@@ -555,7 +682,7 @@
     };
 
     /* ============================================================
-       9. PAGES.forum —— 更多帖子 + 帖子级点赞
+       10. PAGES.forum —— 更多帖子 + 帖子级点赞
        ============================================================ */
     PAGES.forum = function () {
       ensureStateFields();
@@ -605,7 +732,7 @@
     };
 
     /* ============================================================
-       10. PAGES.notice —— 滚动触发 + 预推张夏夏消息
+       11. PAGES.notice —— 滚动触发 + 预推张夏夏消息
        ============================================================ */
     PAGES.notice = function () {
       var n = state.db.notice;
@@ -670,7 +797,7 @@
     };
 
     /* ============================================================
-       11. PAGES.messages / contacts / friendRequests
+       12. PAGES.messages / contacts / friendRequests
        ============================================================ */
     PAGES.messages = function () {
       ensureStateFields();
@@ -779,7 +906,7 @@
     };
 
     /* ============================================================
-       12. PAGES.settings —— 加入个人资料入口
+       13. PAGES.settings —— 加入个人资料入口（头像用自定义底色）
        ============================================================ */
     PAGES.settings = function () {
       ensureStateFields();
@@ -789,7 +916,7 @@
           '<div class="page-body">' +
             '<div class="card" style="margin-top:var(--sp-3);">' +
               '<div class="row" data-action="open-profile">' +
-                '<div class="avatar" style="' + avatarStyle(profileName()) + 'width:44px;height:44px;font-size:22px;">' + esc(profileAvatar()) + '</div>' +
+                '<div class="avatar" style="' + myAvatarStyle() + 'width:44px;height:44px;font-size:22px;">' + esc(profileAvatar()) + '</div>' +
                 '<div class="r-main"><div class="r-title">' + esc(profileName()) + '</div><div class="r-sub">个人资料</div></div>' +
                 '<span class="chev-r">›</span>' +
               '</div>' +
@@ -826,43 +953,79 @@
     };
 
     /* ============================================================
-       13. PAGES.profile —— 个人资料页
+       14. PAGES.profile —— 加颜色选择器
        ============================================================ */
     var AVATAR_OPTIONS = ['🫥', '😎', '🐱', '🐼', '🌙', '🍀', '🎧', '🌊', '🔥', '🦊', '🐰', '🦉', '🍎', '🌵', '⭐', '🎈'];
+    var COLOR_OPTIONS = [
+      { name: '默认', value: 'default' },
+      { name: '蓝', value: '#5B8FF9' },
+      { name: '橙', value: '#F6903D' },
+      { name: '黄', value: '#F6BD16' },
+      { name: '紫', value: '#7262FD' },
+      { name: '青', value: '#78D3F8' },
+      { name: '深紫', value: '#9661BC' },
+      { name: '粉', value: '#F08BB4' },
+      { name: '绿', value: '#3FB37F' },
+      { name: '红', value: '#E8684A' },
+      { name: '淡紫', value: '#9270CA' },
+      { name: '薄荷', value: '#5AD8A6' },
+      { name: '杏', value: '#E8A585' }
+    ];
 
     PAGES.profile = function () {
       ensureStateFields();
       var name = profileName();
       var avatar = profileAvatar();
-      var grid = AVATAR_OPTIONS.map(function (e) {
-        return '<button class="profile-avatar-opt ' + (avatar === e ? 'on' : '') + '" data-action="pick-avatar" data-emoji="' + e + '" style="' + avatarStyle(e) + '">' + e + '</button>';
+      var curColor = state.profile.color || 'default';
+
+      // 预览用的头像底色：优先自定义色
+      var previewStyle = curColor && curColor !== 'default'
+        ? 'background:' + curColor + ';'
+        : avatarStyle(avatar);
+
+      var avGrid = AVATAR_OPTIONS.map(function (e) {
+        return '<button class="profile-avatar-opt ' + (avatar === e ? 'on' : '') +
+          '" data-action="pick-avatar" data-emoji="' + e +
+          '" style="' + (curColor && curColor !== 'default' ? 'background:' + curColor + ';' : avatarStyle(e)) +
+          '">' + e + '</button>';
       }).join('');
+
+      var colorGrid = COLOR_OPTIONS.map(function (c) {
+        var isDefault = c.value === 'default';
+        var bg = isDefault ? 'background:linear-gradient(135deg,#d0d3da,#8b909b);' : 'background:' + c.value + ';';
+        return '<button class="profile-color-opt ' + (curColor === c.value ? 'on' : '') +
+          '" data-action="pick-color" data-color="' + c.value +
+          '" style="' + bg + '" aria-label="' + esc(c.name) + '">' + (isDefault ? '默认' : '') + '</button>';
+      }).join('');
+
       return {
         html: '<div class="page">' +
           navBar('个人资料') +
           '<div class="page-body" style="padding:var(--sp-3);">' +
             '<div class="card" style="padding:var(--sp-4);">' +
               '<div class="flex ac gap3" style="min-width:0;">' +
-                '<div class="avatar" style="' + avatarStyle(name) + 'width:64px;height:64px;font-size:32px;">' + esc(avatar) + '</div>' +
+                '<div class="avatar" style="' + previewStyle + 'width:64px;height:64px;font-size:32px;">' + esc(avatar) + '</div>' +
                 '<div class="r-main" style="min-width:0;">' +
                   '<div class="bold" style="font-size:var(--fs-l);">' + esc(name) + '</div>' +
-                  '<div class="txt-s txt-2">当前昵称 / 头像</div>' +
+                  '<div class="txt-s txt-2">当前昵称 / 头像 / 底色</div>' +
                 '</div>' +
               '</div>' +
               '<div class="dev-label">昵称</div>' +
               '<input class="dev-input" id="profile-name" value="' + esc(name) + '" maxlength="16">' +
               '<div class="dev-label">头像</div>' +
-              '<div class="profile-avatar-grid">' + grid + '</div>' +
+              '<div class="profile-avatar-grid">' + avGrid + '</div>' +
+              '<div class="dev-label">头像底色</div>' +
+              '<div class="profile-color-grid">' + colorGrid + '</div>' +
               '<button class="btn block mt4" data-action="save-profile">保存</button>' +
             '</div>' +
-            '<div class="px4 txt-xs txt-3 center">头像与昵称仅在本机生效</div>' +
+            '<div class="px4 txt-xs txt-3 center">头像、昵称与底色仅在本机生效</div>' +
           '</div>' +
         '</div>'
       };
     };
 
     /* ============================================================
-       14. 新增 action 的捕获阶段拦截
+       15. 新增 action 的捕获阶段拦截
        ============================================================ */
     function handlePatchAction(action, el) {
       if (action === 'open-profile') { Router.push('profile'); return; }
@@ -888,6 +1051,17 @@
         render();
         return;
       }
+      if (action === 'pick-color') {
+        ensureStateFields();
+        var inp3 = document.getElementById('profile-name');
+        if (inp3) {
+          state.profile.name = (inp3.value || '陈默').slice(0, 16).trim() || '陈默';
+        }
+        state.profile.color = el.dataset.color || 'default';
+        save();
+        render();
+        return;
+      }
       if (action === 'forum-like') {
         ensureStateFields();
         var key = el.dataset.key;
@@ -907,7 +1081,7 @@
       if (!el) return;
       var a = el.dataset.action;
       if (a === 'open-profile' || a === 'save-profile' || a === 'pick-avatar' ||
-          a === 'forum-like' || a === 'forum-reply') {
+          a === 'pick-color' || a === 'forum-like' || a === 'forum-reply') {
         e.stopPropagation();
         handlePatchAction(a, el);
       }
@@ -945,7 +1119,7 @@
     }
 
     /* ============================================================
-       15. Router.push 钩子
+       16. Router.push 钩子
        ============================================================ */
     var origPush = Router.push.bind(Router);
     Router.push = function (page, params) {
@@ -961,7 +1135,7 @@
     };
 
     /* ============================================================
-       16. 群邀请触发器
+       17. 群邀请触发器
        ============================================================ */
     var msgAreaTime = 0;
     var lastTick = Date.now();
@@ -993,7 +1167,7 @@
     }, 500);
 
     /* ============================================================
-       17. 补触发
+       18. 补触发
        ============================================================ */
     setTimeout(function () {
       ensureStateFields();
@@ -1001,6 +1175,6 @@
       if (cur.page === 'chat' && cur.params.id === 'by') onOpenChatPatch('by');
     }, 800);
 
-    console.log('[story-patch v1.6] 已加载：默认关闭通知抖动 + v1.5 全部修复');
+    console.log('[story-patch v1.7] 已加载：锁屏兼容 / 头像底色可选 / 消息延迟 ×1.3');
   });
 })();
