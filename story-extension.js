@@ -1,17 +1,19 @@
 /* ================================================================
-   story-extension.js  v2.0
-   剧情累加文件（与 story-patch.js / story-speed.js 并存）
-
+   story-extension.js  v2.1
    加载顺序：story-patch.js → story-extension.js → story-speed.js
 
-   v2.0 新增（在 v1.1 全部原内容基础上）：
-   1. 互助板块 + p_help 帖子
-   2. 问卷提交后的完整分支逻辑（黑屏红字 / 第16题重置 / 王晓歌闪烁）
-   3. s10 群聊（沈敏发现第16题奇怪 + 两个选项 + 后续）
-   4. 周学姐好友申请 + 私聊（备注北苑6号楼 + 论坛指引）
-   5. 互助群（加入按钮 + 群聊 + 两个选项）
-   6. 线索：奇怪的问卷？备忘录
-   7. PAGES.forumPost 支持"加入群聊"按钮
+   v2.1 修复：
+   · 玩家填完问卷回到群聊，"点击填写问卷"光标一直闪烁不清除
+   根因：s9_stage 停在 4，handleByChatExt 进群就 setTimeout 显示光标；
+         playS9PostChoice 末尾也 show。提交问卷后 s9_questionnaire_done
+         变 true，但光标判断没检查它。
+   修复：
+   1. handleByChatExt 的 stage === 4 分支加 !s9_questionnaire_done 判断
+   2. playS9PostChoice 末尾的 CursorGuide.show 加同样判断
+   3. handleSubmitQuestionnaire 提交成功后立即 CursorGuide.hide()
+   4. setInterval 兜底：s9_questionnaire_done 为真时主动 hide 光标
+
+   其余 v2.0 内容全部保留（s10 / 周学姐 / 互助群 / 问卷分支等）
    ================================================================ */
 (function () {
   'use strict';
@@ -144,7 +146,6 @@
       refreshChat(cid);
     }
 
-    // 优先走 story-speed.js 的速度控制
     async function ensureMsgP(cid, msg, baseDelay) {
       if (window.StorySpeed && typeof window.StorySpeed.ensureMsgP === 'function') {
         return window.StorySpeed.ensureMsgP(cid, msg, baseDelay);
@@ -185,7 +186,7 @@
     }
 
     /* ============================================================
-       6. 临爽私聊（保留 v1.1 原版，story-speed.js 会接管具体播放）
+       6. 临爽私聊
        ============================================================ */
     function handleLsChat() {
       if (!flag('ls_added')) return;
@@ -285,7 +286,6 @@
       if (_playingLock['by_s9'] || _playingLock['by_s9_post'] ||
           _playingLock['by_s10'] || _playingLock['by_s10_post'] || _playingLock['by_s10_final']) return;
 
-      // s10 优先
       if (flag('s10_pending') && flag('s10_notified')) {
         handleS10InByChat();
         return;
@@ -308,9 +308,13 @@
       }
       if (stage === 3) { playS9PostChoice(); return; }
       if (stage === 4) {
-        setTimeout(function () {
-          CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
-        }, 500);
+        // v2.1：问卷已提交就不再显示"点击填写问卷"光标
+        if (!flag('s9_questionnaire_done')) {
+          setTimeout(function () {
+            if (flag('s9_questionnaire_done')) return;
+            CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
+          }, 500);
+        }
       }
     }
 
@@ -440,7 +444,10 @@
         var body = document.querySelector('#chat-body');
         if (body) body.scrollTop = body.scrollHeight;
         await sleep(500);
-        CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
+        // v2.1：如果问卷已经提交过（比如从存档恢复），不再显示光标
+        if (!flag('s9_questionnaire_done')) {
+          CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
+        }
       } finally { _playingLock['by_s9_post'] = false; }
     }
 
@@ -773,7 +780,7 @@
     }
 
     /* ============================================================
-       12. 问卷数据（保留 v1.1 原版，题目 1~16）
+       12. 问卷数据
        ============================================================ */
     var Q_DATA = {
       title: '渠京第一中学寒潮预警与宿舍管理规定调查问卷',
@@ -845,10 +852,9 @@
     };
 
     /* ============================================================
-       13. 渲染题目（支持 Q16 override）
+       13. 渲染题目
        ============================================================ */
     function renderQuestion(q, answers) {
-      // v2.0：Q16 已被 override 时替换题目
       if (q.n === 16 && flag('q16_overridden')) {
         q = {
           n: 16, type: 'single',
@@ -915,7 +921,7 @@
     }
 
     /* ============================================================
-       14. 问卷页面（重写，支持分支）
+       14. 问卷页面
        ============================================================ */
     PAGES.questionnaire = function () {
       extEnsure();
@@ -960,12 +966,11 @@
     };
 
     /* ============================================================
-       15. 黑屏红字警告服务
+       15. 黑屏红字警告
        ============================================================ */
     function showWarningScreen(lines, onDone) {
       var layers = document.getElementById('layers');
       if (!layers) { onDone && onDone(); return; }
-      // 移除已有的警告层
       var old = document.getElementById('wxg-warning-overlay');
       if (old) old.remove();
 
@@ -1031,7 +1036,7 @@
     }
 
     /* ============================================================
-       16. 问卷提交（带分支）
+       16. 问卷提交
        ============================================================ */
     function collectQuestionnaire() {
       var answers = {};
@@ -1066,10 +1071,8 @@
 
       var answers = collectQuestionnaire();
 
-      // 分支判断：未 override 时检查"修改规则"
       if (!flag('q16_overridden')) {
         if (answers.q16 === '修改规则') {
-          // 大分支一：黑屏警告
           state.questionnaireAnswers = answers;
           state.questionnaireAnswers.q16 = null;
           flag('q16_overridden', true);
@@ -1087,7 +1090,6 @@
         }
       }
 
-      // 已 override 时检查 Q16 是否选填
       if (flag('q16_overridden')) {
         var q16v = answers.q16;
         if (q16v !== '是' && q16v !== '不是') {
@@ -1095,7 +1097,6 @@
           return;
         }
         if (q16v === '不是') {
-          // 小分支一：黑屏红字 + 王晓歌闪烁 + 回锁屏
           state.questionnaireAnswers = answers;
           save();
 
@@ -1131,11 +1132,9 @@
           });
           return;
         }
-        // 选了"是" → 加备忘录线索
         addMemoQuestionnaireClue();
       }
 
-      // 正常提交
       var confirmed = await ConfirmBox.open({
         title: '确认提交',
         body: '提交后不可修改，确定提交吗？',
@@ -1148,6 +1147,10 @@
       state.flags.s9_questionnaire_done = true;
       state.flags.q_stage = 2;
       save();
+
+      // v2.1：提交成功立即清除"点击填写问卷"光标
+      CursorGuide.hide();
+
       Toast.show('问卷已提交');
 
       setTimeout(function () {
@@ -1157,7 +1160,7 @@
     }
 
     /* ============================================================
-       17. PAGES.forumPost（支持"加入"按钮）
+       17. PAGES.forumPost
        ============================================================ */
     PAGES.forumPost = function (params) {
       extEnsure();
@@ -1284,21 +1287,18 @@
        19. 事件委托
        ============================================================ */
     document.addEventListener('click', function (e) {
-      // 提交问卷
       var sub = e.target.closest('[data-action="submit-questionnaire"]');
       if (sub) {
         e.stopPropagation();
         handleSubmitQuestionnaire();
         return;
       }
-      // 加入互助群
       var join = e.target.closest('[data-action="join-group"]');
       if (join) {
         e.stopPropagation();
         if (join.dataset.group === 'huzhu') joinHuzhu();
         return;
       }
-      // 周学姐好友申请通过
       var frAccept = e.target.closest('[data-action="fr-accept"]');
       if (frAccept && frAccept.dataset.id === 'fr_zxj') {
         e.stopPropagation();
@@ -1340,7 +1340,7 @@
     }, true);
 
     /* ============================================================
-       20. 其他输入的"其他"自动选中
+       20. 其他输入自动选中
        ============================================================ */
     document.addEventListener('input', function (e) {
       var el = e.target;
@@ -1364,18 +1364,23 @@
     };
 
     /* ============================================================
-       22. 全局检查（弥补 story-speed.js 覆盖 mount 的问题）
+       22. 全局检查
        ============================================================ */
     setInterval(function () {
       extEnsure();
       var cur = Router.current();
-      if (!cur || cur.page !== 'chat') return;
+      if (!cur) return;
+      // v2.1：问卷已提交，强制清除残留的"点击填写问卷"光标
+      if (flag('s9_questionnaire_done')) {
+        if (CursorGuide && CursorGuide.current) {
+          CursorGuide.hide();
+        }
+      }
+      if (cur.page !== 'chat') return;
       var cid = cur.params.id;
-      // zx / huzhu 由本文件独立管理
       if (cid === 'zx' || cid === 'huzhu') {
         try { onOpenChatPatchExt(cid); } catch (e) { /* 静默 */ }
       }
-      // s10 由本文件独立管理
       if (cid === 'by' && flag('s10_pending') && flag('s10_notified')) {
         try { handleS10InByChat(); } catch (e) { /* 静默 */ }
       }
@@ -1421,6 +1426,6 @@
       _playingLock: _playingLock
     };
 
-    console.log('[story-extension v2.0] 已加载：s10 群聊 / 周学姐好友 / 互助群 / 问卷分支');
+    console.log('[story-extension v2.1] 已加载：光标残留修复');
   });
 })();
