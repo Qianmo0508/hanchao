@@ -1,16 +1,13 @@
 /* ================================================================
-   story-patch.js  v1.2
-   修复清单：
-   1. PAGES.chat 完全重写：仅"妈妈"点击输入框弹校外通讯警示，其余一律点不动
-   2. 备忘录看完后的光标引导：改为回桌面后指向消息 App
-   3. 群聊1看完后的光标引导：回桌面后指向论坛 App（修复指向不存在元素）
-   4. 群邀请通知：玩家看过备忘录后，在消息区域探索累计 8 秒触发
-   5. 论坛帖子通知：滚动到底后 1.5 秒触发，12 秒兜底，不再一进页就弹
-   6. 系统公告第8幕通知：滚动到底后 1.2 秒触发，10 秒兜底，不再一打开就弹
-   7. 第8幕群消息：进入群聊后逐条展示，间隔 1.4~1.6 秒
-   8. 第9幕好友申请：维持原 CHOICES.grp3 末尾触发，但确保第8幕选项出现前不会提前弹
-   9. 所有群消息间隔拉长到 1.4~1.7 秒，给玩家反应时间
-   10. 首次加载时如果玩家已在群聊页，自动补触发一次
+   story-patch.js  v1.3
+   在 v1.2 基础上新增/修复：
+   1. 【关键】第6幕群聊2：点击"临爽：我靠别搞啊，有点吓人了"通知回群聊后，
+      自动续播"临爽/许双荞/沈敏"三条新消息，并弹出固定选项1
+      （①我是她室友陈默 / ②其实我一直阴魂不散哦）
+   2. 好友申请时序确认：仅在 grp3 选项（"大家都早点睡"）之后触发
+   3. 好友申请通过后不接任何后续剧情（用户尚未写完，留空）
+   4. 保留 v1.2 所有修复（群邀请 8 秒触发器、论坛/公告滚动触发、
+      备忘录/群聊1引导、只有妈妈弹警示、群消息间隔 1.4~1.7 秒）
    ================================================================ */
 (function () {
   'use strict';
@@ -23,7 +20,8 @@
         typeof NotifService !== 'undefined' &&
         typeof Typewriter !== 'undefined' &&
         typeof themSay !== 'undefined' &&
-        typeof refreshChat !== 'undefined') {
+        typeof refreshChat !== 'undefined' &&
+        typeof CHOICES !== 'undefined') {
       fn();
     } else {
       setTimeout(function () { ready(fn); }, 80);
@@ -33,18 +31,9 @@
   ready(function () {
 
     /* ============================================================
-       0. 工具：补丁内部使用
-       ============================================================ */
-    var P = {
-      chat: function (params) { return PAGES.chat(params); },
-      home: function () { return PAGES.home(); }
-    };
-
-    /* ============================================================
        1. PAGES.chat 完全重写
           - 仅 cid === 'mom' 保留 data-action="send-blocked"
           - 其余所有会话输入框 dead，不弹任何提示
-          - 保留消息渲染、卡片、链接、固定选项、群聊发言者显示
        ============================================================ */
     PAGES.chat = function (params) {
       var cid = params.id;
@@ -104,10 +93,8 @@
       } else if (chat.type === 'self' || chat.silent) {
         inputArea = '<div class="chat-input"><div class="input-fake dead">发送消息</div></div>';
       } else if (cid === 'mom') {
-        // 只有妈妈这一处是校外人员，点击弹警示
         inputArea = '<div class="chat-input"><div class="input-fake" data-action="send-blocked" data-chat="mom">发送消息…</div></div>';
       } else {
-        // 其余全部点不动，不弹任何提示
         inputArea = '<div class="chat-input"><div class="input-fake dead">发送消息…</div></div>';
       }
 
@@ -134,6 +121,11 @@
 
     /* ============================================================
        2. onOpenChatPatch：群聊进入钩子
+          按剧情顺序依次检测：
+          a) 首次进群 → 加入系统消息
+          b) 第4幕群聊1（grp1msgs）
+          c) 第6幕群聊2（grp2msgs）—— 需 readPost1 为真且当前无等待选项
+          d) 第8幕群聊（s8msgs）—— 需 pending_s8 为真
        ============================================================ */
     function onOpenChatPatch(cid) {
       if (cid !== 'by') return;
@@ -153,15 +145,27 @@
         setTimeout(function () { render(); }, 40);
       }
 
+      // 第4幕群聊1
       if (flag('invited') && !flag('grp1msgs')) {
         flag('grp1msgs', true);
         setTimeout(function () { runGroup1Patch(); }, 1000);
+        return;
       }
 
+      // 第6幕群聊2：玩家已读完论坛帖子，且当前没有未处理的固定选项
+      if (flag('readPost1') && !flag('grp2msgs') &&
+          !(state.choice && state.choice.chatId === 'by')) {
+        flag('grp2msgs', true);
+        setTimeout(function () { runGroup2Patch(); }, 1000);
+        return;
+      }
+
+      // 第8幕群聊
       if (flag('pending_s8') && !flag('s8msgs')) {
         flag('pending_s8', false);
         flag('s8msgs', true);
         setTimeout(function () { runScene8MsgsPatch(); }, 1000);
+        return;
       }
     }
 
@@ -178,7 +182,6 @@
 
       if (!flag('forumGuided')) {
         flag('forumGuided', true);
-        // 关键修复：回桌面（论坛图标只存在于桌面）
         Router.root('home');
         setTimeout(function () {
           CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛');
@@ -187,7 +190,30 @@
     }
 
     /* ============================================================
-       4. 第8幕群消息 + 固定选项2
+       4. 第6幕群消息 + 固定选项1
+          由 readPost1 触发：玩家点"临爽：我靠别搞啊"通知回群聊后自动续播
+       ============================================================ */
+    async function runGroup2Patch() {
+      var cid = 'by';
+      await themSay(cid, '临爽', '我靠别搞啊，有点吓人了', 1200);
+      await themSay(cid, '许双荞', '群主是周学姐吗？', 1600);
+      await themSay(cid, '沈敏', '@周学姐 学姐拉她干嘛啊啊别来索我命我什么都没干', 1600);
+      await sleep(700);
+
+      state.choice = {
+        chatId: cid,
+        nodeId: 'grp1',
+        options: [
+          { k: 'a', label: '①我是她室友陈默' },
+          { k: 'b', label: '②其实我一直阴魂不散哦' }
+        ]
+      };
+      save();
+      refreshChat(cid);
+    }
+
+    /* ============================================================
+       5. 第8幕群消息 + 固定选项2
        ============================================================ */
     async function runScene8MsgsPatch() {
       var cid = 'by';
@@ -209,11 +235,12 @@
           { k: 'b', label: '②这很不对劲' }
         ]
       };
+      save();
       refreshChat(cid);
     }
 
     /* ============================================================
-       5. PAGES.home 包装：显示引导光标
+       6. PAGES.home 包装：显示引导光标
        ============================================================ */
     var origHome = PAGES.home;
     PAGES.home = function () {
@@ -229,7 +256,7 @@
           }, 900);
         }
 
-        // 群聊1看完后的论坛引导（如果玩家还没进过论坛）
+        // 群聊1看完后的论坛引导
         if (flag('forumGuided') && !flag('forumVisited')) {
           setTimeout(function () {
             CursorGuide.show('[data-app="forum"]', '去看看渠中校园论坛');
@@ -240,7 +267,7 @@
     };
 
     /* ============================================================
-       6. PAGES.memoDetail 包装：轮询检测打字完成
+       7. PAGES.memoDetail 包装：打字完成后触发消息引导
        ============================================================ */
     var origMemoDetail = PAGES.memoDetail;
     PAGES.memoDetail = function (params) {
@@ -257,7 +284,6 @@
             if (!flag('memoGuideShown')) {
               flag('memoGuideShown', true);
               flag('needMsgGuide', true);
-              // 在备忘录页显示指向返回按钮的引导
               var backBtn = root.querySelector('[data-action="back"]');
               if (backBtn) {
                 CursorGuide.show('[data-action="back"]', '返回桌面，去看看消息');
@@ -274,7 +300,7 @@
     };
 
     /* ============================================================
-       7. PAGES.forumPost 完全重写：滚动到底触发通知
+       8. PAGES.forumPost 完全重写：滚动到底触发通知
        ============================================================ */
     PAGES.forumPost = function (params) {
       var p = state.db.forum.posts.find(function (x) { return x.id === params.id; });
@@ -334,14 +360,13 @@
               }
             }, { passive: true });
           }
-          // 兜底：即使不滚动，12 秒后也触发
           setTimeout(trigger, 12000);
         }
       };
     };
 
     /* ============================================================
-       8. PAGES.notice 完全重写：滚动到底触发第8幕通知
+       9. PAGES.notice 完全重写：滚动到底触发第8幕通知
        ============================================================ */
     PAGES.notice = function () {
       var n = state.db.notice;
@@ -395,14 +420,13 @@
               }
             }, { passive: true });
           }
-          // 兜底：即使不滚动，10 秒后也触发
           setTimeout(trigger, 10000);
         }
       };
     };
 
     /* ============================================================
-       9. Router.push 钩子：标记引导完成
+       10. Router.push 钩子：标记引导完成
        ============================================================ */
     var origPush = Router.push.bind(Router);
     Router.push = function (page, params) {
@@ -417,8 +441,7 @@
     };
 
     /* ============================================================
-       10. 群邀请触发器
-           条件：已看过备忘录，在消息区域探索累计 8 秒
+       11. 群邀请触发器：看备忘录后，在消息区域探索累计 8 秒
        ============================================================ */
     var msgAreaTime = 0;
     var lastTick = Date.now();
@@ -445,7 +468,6 @@
       if (inMsgArea) {
         msgAreaTime += dt;
       } else {
-        // 离开消息区域时缓慢衰减，避免玩家被迫一直待着
         msgAreaTime = Math.max(0, msgAreaTime - dt * 0.6);
       }
 
@@ -462,23 +484,43 @@
     }, 500);
 
     /* ============================================================
-       11. 补触发：如果补丁加载时玩家已经在群聊
+       12. 好友申请通过后：先留空（用户后续再补剧情）
        ============================================================ */
-    setTimeout(function () {
-      var cur = Router.current();
-      if (cur.page === 'chat' && cur.params.id === 'by') {
-        onOpenChatPatch('by');
-      }
-    }, 800);
+    var origHandleAction = window.handleAction;
+    if (typeof origHandleAction === 'function') {
+      window.handleAction = async function (action, el) {
+        if (action === 'fr-accept') {
+          var id = el.dataset.id;
+          var fr = state.db.friendRequests.find(function (x) { return x.id === id; });
+          if (fr && fr.status === 'pending') {
+            fr.status = 'accepted';
+            var c = state.db.contacts.find(function (x) { return x.name === fr.from; });
+            if (c) c.hidden = false;
+            // 临爽的私聊会话
+            if (fr.from === '临爽' && !state.db.chats.ls) {
+              state.db.chats.ls = {
+                id: 'ls', type: 'private', name: '临爽', avatar: '😆',
+                canSend: false, warn: '寒潮期间禁止与校外人员通讯',
+                messages: []
+              };
+            }
+            save();
+            Toast.show('已通过好友申请');
+            // 后续剧情留空（用户尚未写完）
+            render();
+            return;
+          }
+        }
+        return origHandleAction(action, el);
+      };
+    }
 
     /* ============================================================
-       12. 兼容：原 CHOICES.grp3 末尾触发 scene9
-           这里只做一次时序保险，确保第8幕选项出现前不会提前弹
+       13. scene9 拦截：确保好友申请通知在"大家都早点睡"之后才弹
        ============================================================ */
-    var origTriggerStory = triggerStory;
+    var origTriggerStory = window.triggerStory;
     window.triggerStory = function (id) {
       if (id === 'scene9') {
-        // 只有第8幕选项处理完（grp3done）才允许触发
         if (!flag('grp3done')) {
           console.warn('[story-patch] scene9 被提前调用，已拦截');
           return;
@@ -487,6 +529,16 @@
       return origTriggerStory(id);
     };
 
-    console.log('[story-patch v1.2] 已加载，全部修复生效');
+    /* ============================================================
+       14. 补触发：如果补丁加载时玩家已在群聊
+       ============================================================ */
+    setTimeout(function () {
+      var cur = Router.current();
+      if (cur.page === 'chat' && cur.params.id === 'by') {
+        onOpenChatPatch('by');
+      }
+    }, 800);
+
+    console.log('[story-patch v1.3] 已加载：第6幕群聊2自动续播，好友申请时序确认');
   });
 })();
