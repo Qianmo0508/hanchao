@@ -1,19 +1,9 @@
 /* ================================================================
-   story-patch.js  v1.7
-   v1.7 新增 / 修复（在 v1.6 基础上）：
-   1. 【锁屏解锁兼容性】重写 PAGES.lock 的 mount：
-      - 同时绑定 touchstart/touchmove/touchend 与 pointerdown/pointerup
-      - 滑动阈值降到 30px，横向容差 100px
-      - 点击兜底：点底部"上滑解锁"提示 / 手写区 / 顶部时间区 也能进密码
-      - 桌面端点击任意空白处直接进密码
-   2. 【头像颜色】avatarColor 改用 Array.from + codePointAt，
-      彻底修复不同 emoji 落到同一紫色的问题；
-      个人资料页新增"头像底色"选择器（12 色 + 默认），
-      自己发的消息头像 / 设置页头像使用自定义色。
-   3. 【消息频率】新增 themSayP 包装，所有剧情对话延迟 ×1.3，
-      稍微放慢节奏，方便看清。
-   4. 保留 v1.6 全部修复（forumLikes 崩溃兜底、每页 12 App、
-      好友申请时序、预推消息、论坛互动、个人资料、默认关通知抖动）。
+   story-patch.js  v1.9
+   v1.9 修复（在 v1.8 基础上，仅一处改动）：
+   - 通过临爽好友后，备注只写"北苑411"，不再带"412 对门"
+     （联系人名称仍为"临爽-北苑411"）
+   - 其余全部保留 v1.8 内容
    放置位置：主 HTML </body> 之前，独立文件 story-patch.js
    ================================================================ */
 (function () {
@@ -31,7 +21,8 @@
         typeof CHOICES !== 'undefined' &&
         typeof APP_LIST !== 'undefined' &&
         typeof DOCK_APPS !== 'undefined' &&
-        typeof state !== 'undefined') {
+        typeof state !== 'undefined' &&
+        typeof ConfirmBox !== 'undefined') {
       fn();
     } else {
       setTimeout(function () { ready(fn); }, 80);
@@ -63,7 +54,7 @@
     document.head.appendChild(st);
 
     /* ============================================================
-       1. 头像颜色工具（v1.7：用 Array.from + codePointAt 支持 emoji）
+       1. 头像颜色工具
        ============================================================ */
     var PALETTE = [
       '#5B8FF9', '#F6903D', '#F6BD16', '#7262FD',
@@ -89,7 +80,6 @@
       ensureStateFields();
       return (state.profile && state.profile.name) || '陈默';
     }
-    // v1.7：自己的头像优先使用自定义底色
     function myAvatarStyle() {
       ensureStateFields();
       var c = state.profile && state.profile.color;
@@ -123,7 +113,7 @@
     }
 
     /* ============================================================
-       2.2 v1.7：消息延迟工具（×1.3）
+       2.2 消息延迟工具（×1.3）
        ============================================================ */
     var MSG_SPEED = 1.3;
     async function themSayP(cid, name, text, delay) {
@@ -131,13 +121,66 @@
     }
 
     /* ============================================================
-       3. 数据初始化 / 旧存档兼容
+       3. 清理初始临爽 pending 好友申请（双保险核心函数）
        ============================================================ */
-    if (!state.flags.grp3done) {
-      state.db.friendRequests = (state.db.friendRequests || []).filter(function (f) {
-        return !(f.from === '临爽' && f.status === 'pending');
+    function purgePendingLinShuang() {
+      ensureStateFields();
+      if (state.flags.grp3done) return false;
+      if (!Array.isArray(state.db.friendRequests)) return false;
+      var before = state.db.friendRequests.length;
+      state.db.friendRequests = state.db.friendRequests.filter(function (f) {
+        return !(f && f.from === '临爽' && f.status === 'pending');
       });
+      var changed = state.db.friendRequests.length !== before;
+      if (changed) save();
+      return changed;
     }
+    purgePendingLinShuang();
+
+    /* ============================================================
+       3.1 新增默认联系人：王姨-宿管、李老师-辅导员
+       ============================================================ */
+    (function ensureExtraContacts() {
+      ensureStateFields();
+      if (!Array.isArray(state.db.contacts)) state.db.contacts = [];
+      if (!state.db.chats) state.db.chats = {};
+
+      // 王姨-宿管（暂无聊天记录）
+      if (!state.db.contacts.some(function (c) { return c.id === 'wangyi'; })) {
+        state.db.contacts.push({
+          id: 'wangyi', name: '王姨-宿管', avatar: '👵', note: '7号楼宿管'
+        });
+      }
+      if (!state.db.chats.wangyi) {
+        state.db.chats.wangyi = {
+          id: 'wangyi', type: 'private', name: '王姨-宿管', avatar: '👵',
+          canSend: false, warn: '寒潮期间禁止与校外人员通讯',
+          messages: []
+        };
+      }
+
+      // 李老师-辅导员（含 2 条休学相关记录）
+      if (!state.db.contacts.some(function (c) { return c.id === 'lilaoshi'; })) {
+        state.db.contacts.push({
+          id: 'lilaoshi', name: '李老师-辅导员', avatar: '🧑‍🏫', note: '高二（7）班辅导员'
+        });
+      }
+      if (!state.db.chats.lilaoshi) {
+        state.db.chats.lilaoshi = {
+          id: 'lilaoshi', type: 'private', name: '李老师-辅导员', avatar: '🧑‍🏫',
+          canSend: false, warn: '寒潮期间禁止与校外人员通讯',
+          messages: [
+            { id: 'll1', from: 'them', text: '晓歌，休学手续今天提交完了，回家好好休息一段时间。', time: '2024-11-12 15:30' },
+            { id: 'll2', from: 'them', text: '如果有需要随时联系我，学校这边的事老师会帮你留意。', time: '2024-11-12 15:31' }
+          ]
+        };
+      }
+      save();
+    })();
+
+    /* ============================================================
+       4. 数据初始化 / 旧存档兼容
+       ============================================================ */
     if (state.flags.readPost1 && state.db.chats.by &&
         !state.db.chats.by.messages.some(function (m) { return m.text === '我靠别搞啊，有点吓人了'; })) {
       state.db.chats.by.messages.push({
@@ -211,7 +254,7 @@
     }
 
     /* ============================================================
-       4. PAGES.home —— 每页 12 个
+       5. PAGES.home —— 每页 12 个
        ============================================================ */
     PAGES.home = function () {
       ensureStateFields();
@@ -291,7 +334,7 @@
     };
 
     /* ============================================================
-       5. PAGES.lock —— v1.7 重写 mount：滑动/点击 双兜底
+       6. PAGES.lock —— 滑动/点击 双兜底
        ============================================================ */
     var origLock = PAGES.lock;
     PAGES.lock = function () {
@@ -328,32 +371,24 @@
           tracking = false;
           var dy = startY - y;
           var dx = Math.abs(x - startX);
-          // v1.7：阈值降低到 30px，横向容差 100px
           if (dy > 30 && dx < 100) openPin();
         };
 
-        // ---- 触摸事件（移动端优先） ----
         page.addEventListener('touchstart', function (e) {
           if (e.touches.length !== 1) return;
           onStart(e.touches[0].clientX, e.touches[0].clientY, e.target);
         }, { passive: true });
-
         page.addEventListener('touchmove', function (e) {
           if (e.touches.length !== 1) return;
           onMove(e.touches[0].clientX, e.touches[0].clientY, e);
         }, { passive: false });
-
         page.addEventListener('touchend', function (e) {
           if (e.changedTouches.length !== 1) return;
           lastTouchEnd = Date.now();
           onEnd(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
         }, { passive: true });
+        page.addEventListener('touchcancel', function () { tracking = false; }, { passive: true });
 
-        page.addEventListener('touchcancel', function () {
-          tracking = false;
-        }, { passive: true });
-
-        // ---- 指针事件（桌面 / 非触摸） ----
         page.addEventListener('pointerdown', function (e) {
           if (e.pointerType === 'touch') return;
           if (Date.now() - lastTouchEnd < 500) return;
@@ -364,19 +399,11 @@
           if (Date.now() - lastTouchEnd < 500) return;
           onEnd(e.clientX, e.clientY);
         });
-        page.addEventListener('pointercancel', function () {
-          tracking = false;
-        });
+        page.addEventListener('pointercancel', function () { tracking = false; });
 
-        // ---- 点击兜底 ----
         page.addEventListener('click', function (e) {
           if (e.target.closest('.lock-notif')) return;
-          // 桌面端：点任意空白处直接进密码
-          if (window.matchMedia('(pointer:fine)').matches) {
-            openPin();
-            return;
-          }
-          // 移动端：点底部提示 / 手写区 / 顶部时间区 也能进密码
+          if (window.matchMedia('(pointer:fine)').matches) { openPin(); return; }
           if (e.target.closest('.lock-bottom') ||
               e.target.closest('.lock-handwrite') ||
               e.target.closest('.lock-top')) {
@@ -388,7 +415,7 @@
     };
 
     /* ============================================================
-       6. PAGES.chat
+       7. PAGES.chat
        ============================================================ */
     PAGES.chat = function (params) {
       ensureStateFields();
@@ -429,7 +456,6 @@
         }
         var avKey = isMe ? profileName() : (chat.type === 'group' ? (m.from || '?') : chat.name);
         var avEmoji = isMe ? profileAvatar() : (chat.type === 'group' ? (m.from || '?').slice(0, 1) : chat.avatar);
-        // v1.7：自己发的消息头像使用自定义底色
         var avStyle = isMe ? myAvatarStyle() : avatarStyle(avKey);
         msgsHtml += '<div class="msg ' + (isMe ? 'me' : '') + '">' +
           '<div class="msg-av" style="' + avStyle + '">' + avEmoji + '</div>' +
@@ -478,7 +504,7 @@
     };
 
     /* ============================================================
-       7. onOpenChatPatch + 剧情续播
+       8. onOpenChatPatch + 剧情续播
        ============================================================ */
     function onOpenChatPatch(cid) {
       if (cid !== 'by') return;
@@ -567,7 +593,7 @@
     }
 
     /* ============================================================
-       8. PAGES.memoDetail —— 打字完成后触发消息引导
+       9. PAGES.memoDetail —— 打字完成后触发消息引导
        ============================================================ */
     var origMemoDetail = PAGES.memoDetail;
     PAGES.memoDetail = function (params) {
@@ -594,7 +620,7 @@
     };
 
     /* ============================================================
-       9. PAGES.forumPost —— 楼层点赞/回复 + 滚动触发通知
+       10. PAGES.forumPost
        ============================================================ */
     PAGES.forumPost = function (params) {
       ensureStateFields();
@@ -682,7 +708,7 @@
     };
 
     /* ============================================================
-       10. PAGES.forum —— 更多帖子 + 帖子级点赞
+       11. PAGES.forum
        ============================================================ */
     PAGES.forum = function () {
       ensureStateFields();
@@ -732,7 +758,7 @@
     };
 
     /* ============================================================
-       11. PAGES.notice —— 滚动触发 + 预推张夏夏消息
+       12. PAGES.notice
        ============================================================ */
     PAGES.notice = function () {
       var n = state.db.notice;
@@ -797,10 +823,12 @@
     };
 
     /* ============================================================
-       12. PAGES.messages / contacts / friendRequests
+       13. PAGES.messages —— 进页时再清一次 pending 临爽申请
        ============================================================ */
     PAGES.messages = function () {
       ensureStateFields();
+      purgePendingLinShuang();
+
       if (flag('grp3done') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
         state.db.friendRequests.push({
           id: 'fr_ls', from: '临爽', avatar: '😆',
@@ -808,6 +836,7 @@
         });
         save();
       }
+
       var chats = Object.values(state.db.chats)
         .filter(function (c) { return c.type !== 'self' || c.id === 'wxg'; })
         .filter(function (c) { return c.joined !== false; });
@@ -851,6 +880,9 @@
       };
     };
 
+    /* ============================================================
+       14. PAGES.contacts
+       ============================================================ */
     PAGES.contacts = function () {
       ensureStateFields();
       var contacts = state.db.contacts.filter(function (c) { return !c.hidden; });
@@ -869,8 +901,13 @@
       };
     };
 
+    /* ============================================================
+       15. PAGES.friendRequests
+       ============================================================ */
     PAGES.friendRequests = function () {
       ensureStateFields();
+      purgePendingLinShuang();
+
       if (flag('grp3done') && !state.db.friendRequests.some(function (f) { return f.from === '临爽'; })) {
         state.db.friendRequests.push({
           id: 'fr_ls', from: '临爽', avatar: '😆',
@@ -906,7 +943,7 @@
     };
 
     /* ============================================================
-       13. PAGES.settings —— 加入个人资料入口（头像用自定义底色）
+       16. PAGES.settings
        ============================================================ */
     PAGES.settings = function () {
       ensureStateFields();
@@ -953,7 +990,7 @@
     };
 
     /* ============================================================
-       14. PAGES.profile —— 加颜色选择器
+       17. PAGES.profile
        ============================================================ */
     var AVATAR_OPTIONS = ['🫥', '😎', '🐱', '🐼', '🌙', '🍀', '🎧', '🌊', '🔥', '🦊', '🐰', '🦉', '🍎', '🌵', '⭐', '🎈'];
     var COLOR_OPTIONS = [
@@ -978,7 +1015,6 @@
       var avatar = profileAvatar();
       var curColor = state.profile.color || 'default';
 
-      // 预览用的头像底色：优先自定义色
       var previewStyle = curColor && curColor !== 'default'
         ? 'background:' + curColor + ';'
         : avatarStyle(avatar);
@@ -1025,7 +1061,8 @@
     };
 
     /* ============================================================
-       15. 新增 action 的捕获阶段拦截
+       18. 补丁 action（含 fr-accept 拦截）
+       v1.9：临爽备注只写"北苑411"
        ============================================================ */
     function handlePatchAction(action, el) {
       if (action === 'open-profile') { Router.push('profile'); return; }
@@ -1074,6 +1111,55 @@
         openReplySheet(el.dataset.key);
         return;
       }
+      if (action === 'fr-accept') {
+        ensureStateFields();
+        var id = el.dataset.id;
+        var fr = state.db.friendRequests.find(function (x) { return x.id === id; });
+        if (fr && fr.status === 'pending') {
+          fr.status = 'accepted';
+
+          // 更新联系人（v1.9：备注只写"北苑411"）
+          var c = state.db.contacts.find(function (x) { return x.id === 'ls'; }) ||
+                  state.db.contacts.find(function (x) { return x.name === fr.from; });
+          if (c) {
+            c.name = '临爽-北苑411';
+            c.note = '北苑411';
+            c.hidden = false;
+          }
+
+          // 建 / 更新私聊会话
+          if (!state.db.chats.ls) {
+            state.db.chats.ls = {
+              id: 'ls', type: 'private', name: '临爽-北苑411', avatar: '😆',
+              canSend: false, warn: '寒潮期间禁止与校外人员通讯',
+              messages: []
+            };
+          } else {
+            state.db.chats.ls.name = '临爽-北苑411';
+          }
+
+          // 预留 flag 供后续剧情判断
+          state.flags.ls_added = true;
+          save();
+
+          // 弹引导（v1.9：去掉"412 对门"）
+          setTimeout(function () {
+            ConfirmBox.open({
+              title: '已添加临爽',
+              body: '为了方便后续推理，自动备注为：\n\n临爽-北苑411\n\n她正在等你回复。',
+              okText: '去看看',
+              cancelText: '稍后'
+            }).then(function (ok) {
+              if (ok) {
+                Router.push('chat', { id: 'ls' });
+              } else {
+                render();
+              }
+            });
+          }, 200);
+        }
+        return;
+      }
     }
 
     document.addEventListener('click', function (e) {
@@ -1081,7 +1167,8 @@
       if (!el) return;
       var a = el.dataset.action;
       if (a === 'open-profile' || a === 'save-profile' || a === 'pick-avatar' ||
-          a === 'pick-color' || a === 'forum-like' || a === 'forum-reply') {
+          a === 'pick-color' || a === 'forum-like' || a === 'forum-reply' ||
+          a === 'fr-accept') {
         e.stopPropagation();
         handlePatchAction(a, el);
       }
@@ -1119,7 +1206,7 @@
     }
 
     /* ============================================================
-       16. Router.push 钩子
+       19. Router.push 钩子
        ============================================================ */
     var origPush = Router.push.bind(Router);
     Router.push = function (page, params) {
@@ -1135,7 +1222,7 @@
     };
 
     /* ============================================================
-       17. 群邀请触发器
+       20. 群邀请触发器
        ============================================================ */
     var msgAreaTime = 0;
     var lastTick = Date.now();
@@ -1167,7 +1254,7 @@
     }, 500);
 
     /* ============================================================
-       18. 补触发
+       21. 补触发
        ============================================================ */
     setTimeout(function () {
       ensureStateFields();
@@ -1175,6 +1262,6 @@
       if (cur.page === 'chat' && cur.params.id === 'by') onOpenChatPatch('by');
     }, 800);
 
-    console.log('[story-patch v1.7] 已加载：锁屏兼容 / 头像底色可选 / 消息延迟 ×1.3');
+    console.log('[story-patch v1.9] 已加载：临爽备注改为"北苑411"，其余同 v1.8');
   });
 })();
