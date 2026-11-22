@@ -1,19 +1,18 @@
 /* ================================================================
-   story-extension.js  v2.1
+   story-extension.js  v2.2
    加载顺序：story-patch.js → story-extension.js → story-speed.js
 
-   v2.1 修复：
-   · 玩家填完问卷回到群聊，"点击填写问卷"光标一直闪烁不清除
-   根因：s9_stage 停在 4，handleByChatExt 进群就 setTimeout 显示光标；
-         playS9PostChoice 末尾也 show。提交问卷后 s9_questionnaire_done
-         变 true，但光标判断没检查它。
+   v2.2 修复：
+   · 通过周学姐好友申请变成了通过临爽
+   根因：story-patch.js 在 capture 阶段对 [data-action="fr-accept"]
+        做了全局劫持，把所有 fr-accept 都当作临爽处理。
    修复：
-   1. handleByChatExt 的 stage === 4 分支加 !s9_questionnaire_done 判断
-   2. playS9PostChoice 末尾的 CursorGuide.show 加同样判断
-   3. handleSubmitQuestionnaire 提交成功后立即 CursorGuide.hide()
-   4. setInterval 兜底：s9_questionnaire_done 为真时主动 hide 光标
+   1. 重写 PAGES.friendRequests，把 fr_zxj 的 action 换成
+      fr-accept-zxj / fr-ignore-zxj（专属，不会被 story-patch 劫持）
+   2. 在 story-extension.js 里独立处理 fr-accept-zxj / fr-ignore-zxj
+   3. 通过后正常备注"周学姐-北苑6号楼"、建会话、引导进 zx 私聊
 
-   其余 v2.0 内容全部保留（s10 / 周学姐 / 互助群 / 问卷分支等）
+   其余 v2.1 内容全部保留（含光标残留修复）
    ================================================================ */
 (function () {
   'use strict';
@@ -308,7 +307,6 @@
       }
       if (stage === 3) { playS9PostChoice(); return; }
       if (stage === 4) {
-        // v2.1：问卷已提交就不再显示"点击填写问卷"光标
         if (!flag('s9_questionnaire_done')) {
           setTimeout(function () {
             if (flag('s9_questionnaire_done')) return;
@@ -444,7 +442,6 @@
         var body = document.querySelector('#chat-body');
         if (body) body.scrollTop = body.scrollHeight;
         await sleep(500);
-        // v2.1：如果问卷已经提交过（比如从存档恢复），不再显示光标
         if (!flag('s9_questionnaire_done')) {
           CursorGuide.show('[data-action="jump"][data-page="questionnaire"]', '点击填写问卷');
         }
@@ -1148,7 +1145,6 @@
       state.flags.q_stage = 2;
       save();
 
-      // v2.1：提交成功立即清除"点击填写问卷"光标
       CursorGuide.hide();
 
       Toast.show('问卷已提交');
@@ -1254,6 +1250,26 @@
     };
 
     /* ============================================================
+       17.1 PAGES.friendRequests —— v2.2 修复：
+       把 fr_zxj 的 action 换成专属 fr-accept-zxj / fr-ignore-zxj，
+       绕过 story-patch.js 对 fr-accept 的全局劫持
+       ============================================================ */
+    var prevFriendRequests = PAGES.friendRequests;
+    PAGES.friendRequests = function (params) {
+      var def = prevFriendRequests(params);
+      // 只替换周学姐那条申请（fr_zxj），临爽 fr_ls 不动
+      def.html = def.html.replace(
+        /data-action="fr-accept" data-id="fr_zxj"/g,
+        'data-action="fr-accept-zxj" data-id="fr_zxj"'
+      );
+      def.html = def.html.replace(
+        /data-action="fr-ignore" data-id="fr_zxj"/g,
+        'data-action="fr-ignore-zxj" data-id="fr_zxj"'
+      );
+      return def;
+    };
+
+    /* ============================================================
        18. 加入互助群
        ============================================================ */
     function joinHuzhu() {
@@ -1287,27 +1303,35 @@
        19. 事件委托
        ============================================================ */
     document.addEventListener('click', function (e) {
+      // 提交问卷
       var sub = e.target.closest('[data-action="submit-questionnaire"]');
       if (sub) {
         e.stopPropagation();
         handleSubmitQuestionnaire();
         return;
       }
+      // 加入互助群
       var join = e.target.closest('[data-action="join-group"]');
       if (join) {
         e.stopPropagation();
         if (join.dataset.group === 'huzhu') joinHuzhu();
         return;
       }
-      var frAccept = e.target.closest('[data-action="fr-accept"]');
-      if (frAccept && frAccept.dataset.id === 'fr_zxj') {
+      // v2.2：周学姐好友申请通过（专属 action，绕过 story-patch 劫持）
+      var acceptZxj = e.target.closest('[data-action="fr-accept-zxj"]');
+      if (acceptZxj) {
         e.stopPropagation();
         e.preventDefault();
-        var fr = state.db.friendRequests.find(function (f) { return f.id === 'fr_zxj'; });
+        var id = acceptZxj.dataset.id;
+        var fr = state.db.friendRequests.find(function (f) { return f.id === id; });
         if (!fr || fr.status !== 'pending') return;
         fr.status = 'accepted';
+
         var c = state.db.contacts.find(function (x) { return x.id === 'zx'; });
-        if (c) {
+        if (!c) {
+          c = { id: 'zx', name: '周学姐-北苑6号楼', avatar: '🎓', note: '北苑6号楼', hidden: false };
+          state.db.contacts.push(c);
+        } else {
           c.name = '周学姐-北苑6号楼';
           c.note = '北苑6号楼';
           c.hidden = false;
@@ -1335,6 +1359,21 @@
             else render();
           });
         }, 200);
+        return;
+      }
+      // v2.2：周学姐好友申请忽略（专属 action）
+      var ignoreZxj = e.target.closest('[data-action="fr-ignore-zxj"]');
+      if (ignoreZxj) {
+        e.stopPropagation();
+        e.preventDefault();
+        var id2 = ignoreZxj.dataset.id;
+        var fr2 = state.db.friendRequests.find(function (f) { return f.id === id2; });
+        if (fr2 && fr2.status === 'pending') {
+          fr2.status = 'ignored';
+          save();
+          Toast.show('已忽略');
+          render();
+        }
         return;
       }
     }, true);
@@ -1370,7 +1409,6 @@
       extEnsure();
       var cur = Router.current();
       if (!cur) return;
-      // v2.1：问卷已提交，强制清除残留的"点击填写问卷"光标
       if (flag('s9_questionnaire_done')) {
         if (CursorGuide && CursorGuide.current) {
           CursorGuide.hide();
@@ -1426,6 +1464,6 @@
       _playingLock: _playingLock
     };
 
-    console.log('[story-extension v2.1] 已加载：光标残留修复');
+    console.log('[story-extension v2.2] 已加载：周学姐好友申请专属 action');
   });
 })();
