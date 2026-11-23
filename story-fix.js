@@ -1,35 +1,31 @@
 /* ================================================================
-   story-fix.js  v2.0
-   最终补丁层（合并 story-fix.js v1.1 + story-extension-2-fix.js v1.0）
+   story-fix.js  v2.1
+   最终补丁层（合并 story-fix.js v2.0 + 本轮修复）
 
    加载顺序：
      story-patch.js → story-extension.js → story-speed.js
      → story-storyline.js → story-extension-2.js → story-fix.js
 
-   功能清单：
-   【防穿透 / 防重复提交】
-   1. overlay 强制 pointer-events: auto（MutationObserver）
-   2. window capture 拦截 submit 重复触发
-   3. ConfirmBox.open 清残留 overlay + 处理"继续？"回档
-   4. 启动清理残留 overlay
+   v2.1 新增修复：
+   1. 领完红包后消息重复两遍
+      根因：story-extension-2.js 里的 continueAfterRedpacket 已经跑
+            一遍（在 handleOpenRedpacket 700ms 后触发），v2.0 的
+            runHuzhuAfterRpOnce 立刻又跑一遍，两路并发推消息，
+            ensureMsgP 的幂等检查因时序差失效 → 消息重复。
+      修复：
+      · handleHuzhuStage9 改为 25 秒兜底（原路径 7~10 秒跑完）
+      · runHuzhuAfterRpOnce 加"最后一条钱逸时消息已存在则 return"检查
+      · addTrust 加 flag 保护（绝不重复加）
+   2. 领完红包后消息不自动滚到底部
+      修复：PAGES.chat.mount 追加 setupAutoScroll：
+            · 立即 + 100/300/600/1000ms 各滚一次（覆盖布局抖动）
+            · MutationObserver 监听 #chat-body 内容变化，
+              玩家在底部附近（<100px）时自动滚到底，
+              玩家主动向上翻消息时不会被打断
 
-   【光标 / 论坛】
-   5. CursorGuide.show 双重拦截：
-      · s9_questionnaire_done 时忽略"点击填写问卷"
-      · redpacket_opened 时忽略"领取红包"
-   6. 互助板块 p_help 幂等补回（启动时 + 每 2s 兜底 + 每次 forum 渲染前）
-   7. 论坛自动切互助板块（zx_stage >= 2 且未看过）
-
-   【红包 / 入睡 / 夜间】
-   8. CHOICES.huzhu_3.a/b 入口拦截（huzhu_done / redpacket_opened /
-      huzhu_redpacket_pending / _lock 任一为真则跳过，彻底避免重跑）
-   9. handleOpenRedpacket 覆盖（领取后 stage 8→9）
-   10. 红包卡片显示金额 ￥1000.00
-   11. huzhu_after_rp_done 补完后续消息（runHuzhuAfterRpOnce）
-   12. 入睡按钮即时出现（PAGES.chat.mount 末尾 tryAddSleepButtonNow）
-   13. 夜间备忘录自动进入（覆盖 CHOICES.night_ls.a / c）
-   14. 回档后完整重置（night_started_done 等）
-   15. 定时清理红包残留光标 / stage 8 兜底推 9
+   保留 v2.0 全部内容（论坛 p_help 恢复、光标双重拦截、
+   overlay 防穿透、submit 防抖、ConfirmBox 清场 + 回档重置、
+   红包光标/金额修复、入睡按钮即时出现、夜间备忘录自动进等）
    ================================================================ */
 (function () {
   'use strict';
@@ -60,9 +56,6 @@
 
   baseReady(function () {
 
-    /* ============================================================
-       0. 通用引用
-       ============================================================ */
     var _lock = (window.StoryExtension && window.StoryExtension._playingLock) || {};
     var EXT2 = window.StoryExtension2 || null;
 
@@ -140,14 +133,12 @@
        ============================================================ */
     var origShow = CursorGuide.show;
     CursorGuide.show = function (selector, label) {
-      // 问卷已提交，忽略指向问卷的光标
       if (flag('s9_questionnaire_done')) {
         if ((typeof selector === 'string' && selector.indexOf('questionnaire') >= 0) ||
             (label && String(label).indexOf('填写问卷') >= 0)) {
           return;
         }
       }
-      // 红包已领，忽略指向红包的光标
       if (flag('redpacket_opened_rp_huzhu_1000')) {
         if ((typeof selector === 'string' && selector.indexOf('open-redpacket') >= 0) ||
             (label && String(label).indexOf('领取红包') >= 0)) {
@@ -232,8 +223,6 @@
 
     /* ============================================================
        6. ConfirmBox.open 统一包装
-          · 弹窗前清残留 overlay
-          · "继续？"回档后做完整重置
        ============================================================ */
     var prevConfirm = ConfirmBox.open;
     ConfirmBox.open = async function (opts) {
@@ -309,7 +298,7 @@
     if (stale2) stale2.remove();
 
     /* ============================================================
-       8. CHOICES.huzhu_3.a / b 入口拦截（彻底防重跑）
+       8. CHOICES.huzhu_3.a / b 入口拦截
        ============================================================ */
     (function wrapHuzhu3() {
       if (!CHOICES.huzhu_3) return;
@@ -336,7 +325,7 @@
     })();
 
     /* ============================================================
-       9. handleOpenRedpacket 覆盖（领取后 stage 8→9）
+       9. handleOpenRedpacket 覆盖
        ============================================================ */
     if (EXT2 && typeof EXT2.handleOpenRedpacket === 'function') {
       var origHandleRp = EXT2.handleOpenRedpacket;
@@ -359,7 +348,7 @@
     }
 
     /* ============================================================
-       10. 红包卡片装饰（显示 ￥1000.00）
+       10. 红包卡片装饰
        ============================================================ */
     function decorateRedpackets(root) {
       var cards = root.querySelectorAll('.redpacket-card');
@@ -412,7 +401,7 @@
     }
 
     /* ============================================================
-       12. huzhu_stage === 9 兜底补完后续消息
+       12. handleHuzhuStage9 —— 25 秒兜底
        ============================================================ */
     function handleHuzhuStage9() {
       if (flag('huzhu_stage') !== 9) return;
@@ -420,13 +409,30 @@
       if (flag('huzhu_after_rp_done')) return;
       if (_lock['huzhu_rp_cont_fix']) return;
       if (!flag('redpacket_opened_rp_huzhu_1000')) return;
-      setTimeout(runHuzhuAfterRpOnce, 300);
+      if (window.__huzhu_stage9_timer) return;
+      window.__huzhu_stage9_timer = setTimeout(function () {
+        window.__huzhu_stage9_timer = null;
+        if (!flag('huzhu_done') && !_lock['huzhu_rp_cont_fix']) {
+          runHuzhuAfterRpOnce();
+        }
+      }, 25000);
     }
 
     async function runHuzhuAfterRpOnce() {
       if (_lock['huzhu_rp_cont_fix']) return;
       if (flag('huzhu_after_rp_done')) return;
       if (flag('huzhu_done')) return;
+      // 关键保护：如果原 continueAfterRedpacket 已经推过最后一条，
+      // 说明流程正常，不再补
+      var chat0 = state.db.chats && state.db.chats.huzhu;
+      var hasQianFinal = chat0 && Array.isArray(chat0.messages) && chat0.messages.some(function (m) {
+        return m.from === '钱逸时' && m.text && m.text.indexOf('万恶的渠中校园钱包') >= 0;
+      });
+      if (hasQianFinal) {
+        flag('huzhu_after_rp_done', true);
+        save();
+        return;
+      }
       _lock['huzhu_rp_cont_fix'] = true;
       flag('huzhu_after_rp_done', true);
       save();
@@ -438,7 +444,11 @@
         await sp.ensureMsgP(cid, { from: '周未', text: '我是一个愤怒的普通人，@钱逸时 现在要小心了' }, 1700);
         await sp.ensureMsgP(cid, { from: '许双荞', text: '。到底是谁修电闸' }, 1500);
         await sp.ensureMsgP(cid, { from: '钱逸时', text: '错了错了错了，明天每个人找我领超级大红包，现在我限额了…万恶的渠中校园钱包还特么有限额' }, 1900);
-        if (typeof addTrust === 'function') addTrust(['钱逸时'], 3);
+        if (!flag('huzhu_after_rp_trust_added')) {
+          flag('huzhu_after_rp_trust_added', true);
+          save();
+          if (typeof addTrust === 'function') addTrust(['钱逸时'], 3);
+        }
         if (typeof trustNote === 'function') {
           await sp.ensureMsgP(cid, { type: 'system', text: trustNote(['钱逸时'], 3) }, 800);
         }
@@ -454,7 +464,7 @@
     }
 
     /* ============================================================
-       13. 夜间备忘录构建（覆盖 CHOICES.night_ls）
+       13. 夜间备忘录构建
        ============================================================ */
     function buildNight1Memo() {
       if (state.db.memos.some(function (m) { return m.id === 'night1'; })) return;
@@ -548,10 +558,48 @@
     }
 
     /* ============================================================
-       14. 包装 PAGES.chat.mount
-          · decorateRedpackets
-          · tryAddSleepButtonNow
-          · handleHuzhuStage9
+       14. 自动滚动到底部（v2.1 新增）
+       ============================================================ */
+    function setupAutoScroll(root) {
+      var body = root.querySelector('#chat-body');
+      if (!body) return;
+
+      function scrollToBottomIfNear() {
+        if (!body.isConnected) return;
+        var distance = body.scrollHeight - body.scrollTop - body.clientHeight;
+        // 玩家在底部附近（100px 内）才自动滚，避免打断向上翻看
+        if (distance < 100 || body.scrollTop === 0) {
+          body.scrollTop = body.scrollHeight;
+        }
+      }
+
+      // 立即 + 多次延迟：覆盖新消息插入、布局抖动、动画结束
+      scrollToBottomIfNear();
+      setTimeout(scrollToBottomIfNear, 50);
+      setTimeout(scrollToBottomIfNear, 150);
+      setTimeout(scrollToBottomIfNear, 300);
+      setTimeout(scrollToBottomIfNear, 600);
+      setTimeout(scrollToBottomIfNear, 1000);
+
+      // MutationObserver：内容变化时自动滚
+      if (window.MutationObserver && !body.__autoScrollObserver) {
+        var obs = new MutationObserver(function () {
+          var nearBottom = (body.scrollHeight - body.scrollTop - body.clientHeight) < 100;
+          if (nearBottom) {
+            requestAnimationFrame(function () {
+              if (body.isConnected) body.scrollTop = body.scrollHeight;
+            });
+          }
+        });
+        try {
+          obs.observe(body, { childList: true, subtree: true, characterData: true });
+          body.__autoScrollObserver = obs;
+        } catch (e) { /* 忽略 */ }
+      }
+    }
+
+    /* ============================================================
+       15. PAGES.chat.mount 统一包装
        ============================================================ */
     var prevChat = PAGES.chat;
     PAGES.chat = function (params) {
@@ -560,6 +608,7 @@
       def.mount = function (root) {
         if (prevMount) prevMount(root);
         try {
+          setupAutoScroll(root);
           decorateRedpackets(root);
           tryAddSleepButtonNow(root);
           if (params.id === 'huzhu') {
@@ -573,9 +622,8 @@
     };
 
     /* ============================================================
-       15. 定时兜底
+       16. 定时兜底
        ============================================================ */
-    // 清理红包残留光标
     setInterval(function () {
       if (flag('redpacket_opened_rp_huzhu_1000') &&
           CursorGuide.current &&
@@ -585,7 +633,6 @@
       }
     }, 500);
 
-    // stage 8 兜底推 9（红包已领但 stage 卡在 8）
     setInterval(function () {
       if (flag('huzhu_stage') === 8 &&
           flag('redpacket_opened_rp_huzhu_1000') &&
@@ -595,7 +642,6 @@
       }
     }, 1000);
 
-    // 入睡按钮兜底（如果因为某些原因 PAGES.chat.mount 没被执行）
     setInterval(function () {
       if (!flag('s11_sleep_ready')) return;
       var cur = Router.current();
@@ -606,16 +652,40 @@
       tryAddSleepButtonNow(document.querySelector('.page-body') || document.body);
     }, 800);
 
+    // v2.1 兜底：领完红包后 30 秒仍未 huzhu_done 且消息未播完，兜底一次
+    setInterval(function () {
+      if (!flag('redpacket_opened_rp_huzhu_1000')) return;
+      if (flag('huzhu_done')) return;
+      if (flag('huzhu_after_rp_done')) return;
+      if (_lock['huzhu_rp_cont']) return;
+      if (_lock['huzhu_rp_cont_fix']) return;
+      var chat = state.db.chats && state.db.chats.huzhu;
+      if (!chat) return;
+      var hasQian = chat.messages && chat.messages.some(function (m) {
+        return m.from === '钱逸时' && m.text && m.text.indexOf('万恶的渠中校园钱包') >= 0;
+      });
+      if (hasQian) {
+        flag('huzhu_after_rp_done', true);
+        flag('huzhu_done', true);
+        save();
+        return;
+      }
+      if (flag('huzhu_stage') === 9) {
+        runHuzhuAfterRpOnce();
+      }
+    }, 30000);
+
     /* ============================================================
-       16. 暴露 API
+       17. 暴露 API
        ============================================================ */
     window.StoryFix = {
       ensureHelpBoardFull: ensureHelpBoardFull,
       decorateRedpackets: decorateRedpackets,
       tryAddSleepButtonNow: tryAddSleepButtonNow,
-      runHuzhuAfterRpOnce: runHuzhuAfterRpOnce
+      runHuzhuAfterRpOnce: runHuzhuAfterRpOnce,
+      setupAutoScroll: setupAutoScroll
     };
 
-    console.log('[story-fix v2.0] 已加载：合并 fix + ext2-fix，红包/入睡/夜间/回档全修复');
+    console.log('[story-fix v2.1] 已加载：修复红包后消息重复 + 自动滚动');
   });
 })();
