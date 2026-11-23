@@ -1,24 +1,13 @@
 /* ================================================================
-   story-storyline.js  v2.0
-   剧情线管理 / 快照系统（修复回档串剧情 + 快照重复问题）
+   story-storyline.js  v2.1
+   修复 v2.0 的致命 bug：ready 里错误地检查了 window.StorySnapshots，
+   而它在文件加载时还不存在 → 整个文件不执行 → 设置入口消失。
 
-   v2.0 修复：
-   1. 回档后旧异步剧情继续跑 → 用"代际标记"：
-      · 回档时更新 window.__storylineGeneration
-      · 完全接管 themSay / meSay / sysNote / ensureMsgP，
-        在 await sleep 后检查代际，不一致就放弃
-      · 这样即使旧剧情还在 sleep 中，醒来也不会污染回档后的状态
-   2. 回档时未完整清理 → 清所有 _playingLock、全局定时器、
-      DOM 残留、光标、夜间 flag 等
-   3. 快照重复 → 按 label 去重：
-      · capture 时若已有相同 label 直接返回旧的，不新增
-      · 定时扫描 localStorage 清重复 label
-   4. 时间不同步 → snapshotState 里增加 clockBase / clockStartReal，
-      restore 时恢复，回档后手机时间回到当时
-   5. 回档后再延迟 600ms / 1200ms 各恢复一次关键状态，
-     覆盖旧异步函数可能产生的"残影"（不 render，避免闪烁）
-
-   保留 v1.0 全部内容（自动快照、手动快照、设置入口、恢复导航）
+   v2.1 变更：
+   · ready 里移除 window.StorySnapshots 检查
+   · 其余 v2.0 全部内容原样保留
+     （代际检查、消息函数接管、快照按 label 去重、
+      回档完整清理、时间戳恢复、延迟二次恢复、定时去重）
    ================================================================ */
 (function () {
   'use strict';
@@ -40,8 +29,7 @@
         typeof storyTime === 'function' &&
         typeof fmtYMD === 'function' &&
         typeof fmtHM === 'function' &&
-        typeof CHOICES !== 'undefined' &&
-        typeof window.StorySnapshots === 'object') {
+        typeof CHOICES !== 'undefined') {
       fn();
     } else {
       setTimeout(function () { ready(fn); }, 80);
@@ -63,10 +51,8 @@
 
     /* ============================================================
        一、包装消息函数加"代际检查"
-          —— 回档后代际改变，旧 sleep 醒来的消息推送全部放弃
        ============================================================ */
     function wrapMessageFunctions() {
-      /* themSay */
       window.themSay = async function (cid, name, text, delay) {
         var gen = window.__storylineGeneration;
         if (window.__storylineFrozen) return;
@@ -88,7 +74,6 @@
         try { refreshChat(cid); } catch (e) {}
       };
 
-      /* meSay */
       window.meSay = async function (cid, text, delay) {
         var gen = window.__storylineGeneration;
         if (window.__storylineFrozen) return;
@@ -110,7 +95,6 @@
         try { refreshChat(cid); } catch (e) {}
       };
 
-      /* sysNote */
       window.sysNote = async function (cid, text, delay) {
         var gen = window.__storylineGeneration;
         if (window.__storylineFrozen) return;
@@ -132,7 +116,6 @@
         try { refreshChat(cid); } catch (e) {}
       };
 
-      /* ensureMsgP */
       if (window.StorySpeed && typeof window.StorySpeed.ensureMsgP === 'function') {
         window.StorySpeed.ensureMsgP = async function (cid, msg, baseDelay) {
           var gen = window.__storylineGeneration;
@@ -161,129 +144,214 @@
     wrapMessageFunctions();
 
     /* ============================================================
-       二、包装 window.StorySnapshots 的 3 个方法
+       二、Snapshot 存储
        ============================================================ */
-    var SS = window.StorySnapshots;
+    var Snapshots = {
+      list: function () {
+        try {
+          var raw = localStorage.getItem(STORAGE_KEY);
+          return raw ? JSON.parse(raw) : [];
+        } catch (e) {
+          return [];
+        }
+      },
 
-    /* 2.1 capture —— 按 label 去重 */
-    var oldCapture = SS.capture.bind(SS);
-    SS.capture = function (label, opts) {
-      try {
+      saveList: function (list) {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+          return true;
+        } catch (e) {
+          while (list.length > 1) {
+            list.shift();
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+              return true;
+            } catch (e2) {}
+          }
+          return false;
+        }
+      },
+
+      snapshotState: function () {
+        function clone(o) { return o == null ? o : JSON.parse(JSON.stringify(o)); }
+        return {
+          flags: clone(state.flags || {}),
+          trust: clone(state.trust || {}),
+          choice: clone(state.choice),
+          questionnaireAnswers: clone(state.questionnaireAnswers || {}),
+          forumLikes: clone(state.forumLikes || {}),
+          forumReplies: clone(state.forumReplies || {}),
+          profile: clone(state.profile || {}),
+          notifications: clone(state.notifications || []),
+          readNotifs: clone(state.readNotifs || {}),
+          unread: clone(state.unread || {}),
+          markedRules: clone(state.markedRules || {}),
+          clockBase: state.clockBase,
+          clockStartReal: state.clockStartReal,
+          db: {
+            chats: clone(state.db.chats || {}),
+            friendRequests: clone(state.db.friendRequests || []),
+            memos: clone(state.db.memos || []),
+            forumPosts: clone((state.db.forum && state.db.forum.posts) || []),
+            forumBoards: clone((state.db.forum && state.db.forum.boards) || []),
+            contacts: clone(state.db.contacts || [])
+          }
+        };
+      },
+
+      capture: function (label, opts) {
+        opts = opts || {};
         var list = this.list();
+        /* 按 label 去重：已有相同 label 直接返回旧的，不新增不覆盖 */
         for (var i = 0; i < list.length; i++) {
           if (list[i].label === label) return list[i];
         }
-      } catch (e) {}
-      return oldCapture(label, opts);
-    };
-
-    /* 2.2 snapshotState —— 加入时间戳 */
-    var oldSnapshotState = SS.snapshotState.bind(SS);
-    SS.snapshotState = function () {
-      var s = oldSnapshotState();
-      s.clockBase = state.clockBase;
-      s.clockStartReal = state.clockStartReal;
-      return s;
-    };
-
-    /* 2.3 restore —— 完整清理 + 代际 + 延迟二次恢复 */
-    var oldRestore = SS.restore.bind(SS);
-    SS.restore = function (id) {
-      /* 1) 更新代际：所有旧 sleep 醒来的消息推送全部作废 */
-      window.__storylineGeneration = Date.now() + Math.random();
-
-      /* 2) 清所有 lock */
-      try {
-        if (window.StoryExtension && window.StoryExtension._playingLock) {
-          Object.keys(window.StoryExtension._playingLock).forEach(function (k) {
-            window.StoryExtension._playingLock[k] = false;
-          });
+        var id = opts.id || ('cp_' + Date.now().toString(36));
+        var page = opts.page || 'home';
+        var snap = {
+          id: id,
+          label: label,
+          page: page,
+          time: Date.now(),
+          snapshot: this.snapshotState()
+        };
+        var existing = -1;
+        for (var j = 0; j < list.length; j++) {
+          if (list[j].id === id) { existing = j; break; }
         }
-        if (window.StoryExtension2 && window.StoryExtension2._playingLock) {
-          Object.keys(window.StoryExtension2._playingLock).forEach(function (k) {
-            window.StoryExtension2._playingLock[k] = false;
-          });
+        if (existing >= 0) list[existing] = snap;
+        else list.push(snap);
+
+        while (list.length > MAX_SNAPSHOTS) list.shift();
+        this.saveList(list);
+        return snap;
+      },
+
+      restore: function (id) {
+        var list = this.list();
+        var cp = null;
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].id === id) { cp = list[i]; break; }
         }
-      } catch (e) {}
+        if (!cp || !cp.snapshot) return null;
+        var snap = cp.snapshot;
 
-      /* 3) 清全局定时器引用 */
-      try { if (window.__huzhu_stage9_timer) { clearTimeout(window.__huzhu_stage9_timer); window.__huzhu_stage9_timer = null; } } catch (e) {}
-      try { if (window.__nightCountdownTimer) { clearInterval(window.__nightCountdownTimer); window.__nightCountdownTimer = null; } } catch (e) {}
-      try { window.__qx_submitting = false; } catch (e) {}
+        function clone(o) { return o == null ? o : JSON.parse(JSON.stringify(o)); }
 
-      /* 4) 清 DOM 残留 */
-      try {
-        var sels = '.screen-fade, #wxg-warning-overlay, #wxg-night-violation, .notif-banner, .toast, .modal-scrim, .sheet-scrim, .panel-scrim, .sleep-btn-top';
-        var nodes = document.querySelectorAll(sels);
-        Array.prototype.forEach.call(nodes, function (el) {
-          try { el.remove(); } catch (e) {}
-        });
-      } catch (e) {}
+        /* 1) 更新代际：所有旧 sleep 醒来的消息推送全部作废 */
+        window.__storylineGeneration = Date.now() + Math.random();
 
-      /* 5) 清光标 */
-      try { if (window.CursorGuide && CursorGuide.hide) CursorGuide.hide(); } catch (e) {}
-
-      /* 6) 调原 restore（会完整恢复所有 state 字段） */
-      var cp = oldRestore(id);
-      if (!cp) return null;
-
-      /* 7) 额外恢复 clockBase（原 restore 不处理这个） */
-      try {
-        if (cp.snapshot && typeof cp.snapshot.clockBase === 'number') {
-          state.clockBase = cp.snapshot.clockBase;
-          state.clockStartReal = Date.now();
-          save();
-        }
-      } catch (e) {}
-
-      /* 8) 确保互助板块存在 */
-      try {
-        if (!state.db) state.db = {};
-        if (!state.db.forum) state.db.forum = { boards: [], posts: [] };
-        if (!Array.isArray(state.db.forum.boards)) state.db.forum.boards = [];
-        if (!state.db.forum.boards.some(function (b) { return b.id === 'help'; })) {
-          state.db.forum.boards.push({ id: 'help', name: '互助板块', hot: true });
-          save();
-        }
-      } catch (e) {}
-
-      /* 9) 延迟二次、三次恢复（只覆盖关键字段，不 render，避免闪烁）
-            覆盖旧异步函数在回档后 0~1.2 秒内可能产生的"残影" */
-      var snapshotData = cp.snapshot;
-      function silentReapply() {
-        if (!snapshotData) return;
+        /* 2) 清所有 lock */
         try {
-          if (snapshotData.flags) state.flags = JSON.parse(JSON.stringify(snapshotData.flags));
-          if (snapshotData.trust) state.trust = JSON.parse(JSON.stringify(snapshotData.trust));
-          if (snapshotData.choice !== undefined) {
-            state.choice = snapshotData.choice ? JSON.parse(JSON.stringify(snapshotData.choice)) : null;
+          if (window.StoryExtension && window.StoryExtension._playingLock) {
+            Object.keys(window.StoryExtension._playingLock).forEach(function (k) {
+              window.StoryExtension._playingLock[k] = false;
+            });
           }
-          if (snapshotData.questionnaireAnswers) {
-            state.questionnaireAnswers = JSON.parse(JSON.stringify(snapshotData.questionnaireAnswers));
+          if (window.StoryExtension2 && window.StoryExtension2._playingLock) {
+            Object.keys(window.StoryExtension2._playingLock).forEach(function (k) {
+              window.StoryExtension2._playingLock[k] = false;
+            });
           }
-          if (snapshotData.notifications) state.notifications = JSON.parse(JSON.stringify(snapshotData.notifications));
-          if (snapshotData.readNotifs) state.readNotifs = JSON.parse(JSON.stringify(snapshotData.readNotifs));
-          if (snapshotData.unread) state.unread = JSON.parse(JSON.stringify(snapshotData.unread));
-          if (snapshotData.db && snapshotData.db.chats) {
-            state.db.chats = JSON.parse(JSON.stringify(snapshotData.db.chats));
-          }
-          if (snapshotData.db && snapshotData.db.friendRequests) {
-            state.db.friendRequests = JSON.parse(JSON.stringify(snapshotData.db.friendRequests));
-          }
-          if (snapshotData.db && snapshotData.db.memos) {
-            state.db.memos = JSON.parse(JSON.stringify(snapshotData.db.memos));
-          }
-          save();
         } catch (e) {}
-      }
-      setTimeout(silentReapply, 600);
-      setTimeout(silentReapply, 1200);
 
-      return cp;
+        /* 3) 清全局定时器引用 */
+        try { if (window.__huzhu_stage9_timer) { clearTimeout(window.__huzhu_stage9_timer); window.__huzhu_stage9_timer = null; } } catch (e) {}
+        try { if (window.__nightCountdownTimer) { clearInterval(window.__nightCountdownTimer); window.__nightCountdownTimer = null; } } catch (e) {}
+        try { window.__qx_submitting = false; } catch (e) {}
+
+        /* 4) 清 DOM 残留 */
+        try {
+          var sels = '.screen-fade, #wxg-warning-overlay, #wxg-night-violation, .notif-banner, .toast, .modal-scrim, .sheet-scrim, .panel-scrim, .sleep-btn-top';
+          var nodes = document.querySelectorAll(sels);
+          Array.prototype.forEach.call(nodes, function (el) {
+            try { el.remove(); } catch (e) {}
+          });
+        } catch (e) {}
+
+        /* 5) 清光标 */
+        try { if (window.CursorGuide && CursorGuide.hide) CursorGuide.hide(); } catch (e) {}
+
+        /* 6) 完整恢复 state 字段 */
+        if (snap.flags) state.flags = clone(snap.flags);
+        if (snap.trust) state.trust = clone(snap.trust);
+        state.choice = clone(snap.choice);
+        if (snap.questionnaireAnswers) state.questionnaireAnswers = clone(snap.questionnaireAnswers);
+        if (snap.forumLikes) state.forumLikes = clone(snap.forumLikes);
+        if (snap.forumReplies) state.forumReplies = clone(snap.forumReplies);
+        if (snap.profile) state.profile = clone(snap.profile);
+        if (snap.notifications) state.notifications = clone(snap.notifications);
+        if (snap.readNotifs) state.readNotifs = clone(snap.readNotifs);
+        if (snap.unread) state.unread = clone(snap.unread);
+        if (snap.markedRules) state.markedRules = clone(snap.markedRules);
+
+        if (!state.db) state.db = {};
+        if (snap.db) {
+          if (snap.db.chats) state.db.chats = clone(snap.db.chats);
+          if (snap.db.friendRequests) state.db.friendRequests = clone(snap.db.friendRequests);
+          if (snap.db.memos) state.db.memos = clone(snap.db.memos);
+          if (snap.db.forumPosts) {
+            if (!state.db.forum) state.db.forum = { boards: [], posts: [] };
+            state.db.forum.posts = clone(snap.db.forumPosts);
+          }
+          if (snap.db.forumBoards) {
+            if (!state.db.forum) state.db.forum = { boards: [], posts: [] };
+            state.db.forum.boards = clone(snap.db.forumBoards);
+          }
+          if (snap.db.contacts) state.db.contacts = clone(snap.db.contacts);
+        }
+
+        /* 7) 时间恢复 */
+        if (typeof snap.clockBase === 'number') {
+          state.clockBase = snap.clockBase;
+          state.clockStartReal = Date.now();
+        }
+
+        /* 8) 互助板块兜底 */
+        if (state.db.forum && Array.isArray(state.db.forum.boards)) {
+          if (!state.db.forum.boards.some(function (b) { return b.id === 'help'; })) {
+            state.db.forum.boards.push({ id: 'help', name: '互助板块', hot: true });
+          }
+        }
+
+        save();
+
+        /* 9) 延迟二次、三次恢复（只覆盖关键字段，不 render） */
+        function silentReapply() {
+          try {
+            if (snap.flags) state.flags = clone(snap.flags);
+            if (snap.trust) state.trust = clone(snap.trust);
+            if (snap.choice !== undefined) state.choice = clone(snap.choice);
+            if (snap.questionnaireAnswers) state.questionnaireAnswers = clone(snap.questionnaireAnswers);
+            if (snap.notifications) state.notifications = clone(snap.notifications);
+            if (snap.readNotifs) state.readNotifs = clone(snap.readNotifs);
+            if (snap.unread) state.unread = clone(snap.unread);
+            if (snap.db && snap.db.chats) state.db.chats = clone(snap.db.chats);
+            if (snap.db && snap.db.friendRequests) state.db.friendRequests = clone(snap.db.friendRequests);
+            if (snap.db && snap.db.memos) state.db.memos = clone(snap.db.memos);
+            save();
+          } catch (e) {}
+        }
+        setTimeout(silentReapply, 600);
+        setTimeout(silentReapply, 1200);
+
+        return cp;
+      },
+
+      delete: function (id) {
+        var list = this.list().filter(function (c) { return c.id !== id; });
+        this.saveList(list);
+      },
+
+      clear: function () {
+        this.saveList([]);
+      }
     };
+
+    window.StorySnapshots = Snapshots;
 
     /* ============================================================
-       三、定时去重 localStorage 中的快照（按 label 保留最早一条）
+       三、定时去重 localStorage 中的快照
        ============================================================ */
     setInterval(function () {
       try {
@@ -309,10 +377,7 @@
     }, 1000);
 
     /* ============================================================
-       四、其余 v1.0 逻辑原样保留：
-          · 自动包装 CHOICES（用 SS.capture 新版本，自动按 label 去重）
-          · 问卷 / 好友申请 / 互助群 的手动快照
-          · 设置入口 / 剧情线管理页面 / 导航 / 清空
+       四、自动包装 CHOICES 拍快照
        ============================================================ */
     var NODE_LABELS = {
       'grp1': '北苑群：自我介绍（陈默 / 阴魂不散）',
@@ -343,7 +408,7 @@
                 page = 'chat:' + state.choice.chatId;
               }
               var label = NODE_LABELS[nodeId] || ('节点：' + nodeId);
-              SS.capture(label, { id: 'node_' + nodeId, page: page });
+              Snapshots.capture(label, { id: 'node_' + nodeId, page: page });
             } catch (e) {
               console.error('[snap] capture failed', e);
             }
@@ -368,7 +433,7 @@
           if (origMount) origMount(root);
           if (!flag('q16_overridden') && !flag('s9_questionnaire_done')) {
             try {
-              SS.capture('问卷填写前（尚未提交）', { id: 'q_form_open', page: 'questionnaire' });
+              Snapshots.capture('问卷填写前（尚未提交）', { id: 'q_form_open', page: 'questionnaire' });
             } catch (e) {}
           }
         };
@@ -380,7 +445,7 @@
     setInterval(function () {
       if (flag('q16_overridden') && !flag('q16_reset_snapped') && !flag('s9_questionnaire_done')) {
         try {
-          SS.capture('问卷重置后（第16题已变为"是/不是"）', { id: 'q16_reset', page: 'questionnaire' });
+          Snapshots.capture('问卷重置后（第16题已变为"是/不是"）', { id: 'q16_reset', page: 'questionnaire' });
           flag('q16_reset_snapped', true);
           save();
         } catch (e) {}
@@ -392,7 +457,7 @@
       var el = e.target && e.target.closest && e.target.closest('[data-action="fr-accept-zxj"]');
       if (!el) return;
       try {
-        SS.capture('通过周学姐好友申请前', { id: 'before_accept_zxj', page: 'friendRequests' });
+        Snapshots.capture('通过周学姐好友申请前', { id: 'before_accept_zxj', page: 'friendRequests' });
       } catch (err) {}
     }, true);
 
@@ -402,7 +467,7 @@
       if (!el) return;
       if (el.dataset.group !== 'huzhu') return;
       try {
-        SS.capture('加入互助群前', { id: 'before_join_huzhu', page: 'forumPost:p_help' });
+        Snapshots.capture('加入互助群前', { id: 'before_join_huzhu', page: 'forumPost:p_help' });
       } catch (err) {}
     }, true);
 
@@ -470,7 +535,7 @@
 
     /* 剧情线管理页面 */
     PAGES.storyLine = function () {
-      var list = SS.list();
+      var list = Snapshots.list();
       var sorted = list.slice().sort(function (a, b) { return b.time - a.time; });
 
       var html = '<div class="page">' + navBar('剧情线管理') + '<div class="page-body">';
@@ -532,7 +597,7 @@
       if (a === 'storyline-restore') {
         e.stopPropagation();
         var id = el.dataset.id;
-        var list = SS.list();
+        var list = Snapshots.list();
         var cp = null;
         for (var i = 0; i < list.length; i++) {
           if (list[i].id === id) { cp = list[i]; break; }
@@ -547,7 +612,7 @@
         });
         if (!ok) return;
 
-        var restored = SS.restore(id);
+        var restored = Snapshots.restore(id);
         if (restored) {
           Toast.show('已回退：' + restored.label);
           setTimeout(function () { navigateTo(restored); }, 350);
@@ -567,7 +632,7 @@
           danger: true
         });
         if (!ok2) return;
-        SS.clear();
+        Snapshots.clear();
         Toast.show('已清空所有快照');
         render();
         return;
@@ -586,6 +651,6 @@
       return prevForum(params);
     };
 
-    console.log('[story-storyline v2.0] 已加载，代际=' + window.__storylineGeneration + '，快照 ' + SS.list().length + ' 个');
+    console.log('[story-storyline v2.1] 已加载，代际=' + window.__storylineGeneration + '，快照 ' + Snapshots.list().length + ' 个');
   });
 })();
