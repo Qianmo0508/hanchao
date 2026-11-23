@@ -1,51 +1,73 @@
 /* ================================================================
-   story-fix.js  v1.1
-   加载顺序：story-patch.js → story-extension.js → story-speed.js
-            → story-fix.js → story-storyline.js
+   story-fix.js  v2.0
+   最终补丁层（合并 story-fix.js v1.1 + story-extension-2-fix.js v1.0）
 
-   v1.1 新增（在 v1.0 基础上）：
-   · 互助板块 p_help 帖子丢失
-     根因：story-storyline.js 回退快照时，用快照里的旧 posts 列表
-          覆盖了 db.forum.posts，把 story-extension.js 加载时补进去的
-          p_help 帖子冲掉了。后续再进互助板块就看不到帖子。
-     修复：
-     1. 每次渲染 PAGES.forum / PAGES.forumPost 时强制 ensureHelpBoard
-        （存在但楼层里没有"加入"按钮也补齐）
-     2. 每 2 秒轮询一次，兜底补回
-     3. 互助板块 board 本身如果丢了也补回
+   加载顺序：
+     story-patch.js → story-extension.js → story-speed.js
+     → story-storyline.js → story-extension-2.js → story-fix.js
 
-   v1.0 原有功能（全部保留）：
-   1. 拦截 CursorGuide.show —— 问卷已提交时忽略"点击填写问卷"
-   2. 论坛自动切互助板块（zx_stage >= 2 且未看过）
-   3. overlay 强制 pointer-events: auto
-   4. window capture 拦截 submit 重复触发
-   5. 包装 ConfirmBox.open 清残留 overlay
-   6. 启动清理残留 overlay
+   功能清单：
+   【防穿透 / 防重复提交】
+   1. overlay 强制 pointer-events: auto（MutationObserver）
+   2. window capture 拦截 submit 重复触发
+   3. ConfirmBox.open 清残留 overlay + 处理"继续？"回档
+   4. 启动清理残留 overlay
+
+   【光标 / 论坛】
+   5. CursorGuide.show 双重拦截：
+      · s9_questionnaire_done 时忽略"点击填写问卷"
+      · redpacket_opened 时忽略"领取红包"
+   6. 互助板块 p_help 幂等补回（启动时 + 每 2s 兜底 + 每次 forum 渲染前）
+   7. 论坛自动切互助板块（zx_stage >= 2 且未看过）
+
+   【红包 / 入睡 / 夜间】
+   8. CHOICES.huzhu_3.a/b 入口拦截（huzhu_done / redpacket_opened /
+      huzhu_redpacket_pending / _lock 任一为真则跳过，彻底避免重跑）
+   9. handleOpenRedpacket 覆盖（领取后 stage 8→9）
+   10. 红包卡片显示金额 ￥1000.00
+   11. huzhu_after_rp_done 补完后续消息（runHuzhuAfterRpOnce）
+   12. 入睡按钮即时出现（PAGES.chat.mount 末尾 tryAddSleepButtonNow）
+   13. 夜间备忘录自动进入（覆盖 CHOICES.night_ls.a / c）
+   14. 回档后完整重置（night_started_done 等）
+   15. 定时清理红包残留光标 / stage 8 兜底推 9
    ================================================================ */
 (function () {
   'use strict';
 
-  function ready(fn) {
-    if (typeof CursorGuide !== 'undefined' &&
-        typeof PAGES !== 'undefined' &&
-        PAGES.forum &&
-        typeof ConfirmBox !== 'undefined' &&
+  function baseReady(fn) {
+    if (typeof PAGES !== 'undefined' &&
+        typeof Router !== 'undefined' &&
+        typeof CursorGuide !== 'undefined' &&
         typeof state !== 'undefined' &&
         typeof flag === 'function' &&
         typeof save === 'function' &&
+        typeof render === 'function' &&
         typeof esc === 'function' &&
+        typeof sleep === 'function' &&
         typeof uid === 'function' &&
-        typeof storyTime === 'function') {
+        typeof storyTime === 'function' &&
+        typeof sysNow === 'function' &&
+        typeof fmtFull === 'function' &&
+        typeof ConfirmBox !== 'undefined' &&
+        typeof NotifService !== 'undefined' &&
+        typeof Toast !== 'undefined' &&
+        typeof CHOICES !== 'undefined') {
       fn();
     } else {
-      setTimeout(function () { ready(fn); }, 80);
+      setTimeout(function () { baseReady(fn); }, 100);
     }
   }
 
-  ready(function () {
+  baseReady(function () {
 
     /* ============================================================
-       0. 确保互助板块 + p_help 帖子存在（幂等）
+       0. 通用引用
+       ============================================================ */
+    var _lock = (window.StoryExtension && window.StoryExtension._playingLock) || {};
+    var EXT2 = window.StoryExtension2 || null;
+
+    /* ============================================================
+       1. 互助板块 p_help 幂等补回
        ============================================================ */
     function ensureHelpBoardFull() {
       if (!state.db) state.db = {};
@@ -55,13 +77,11 @@
 
       var changed = false;
 
-      /* 0.1 互助板块 */
       if (!state.db.forum.boards.some(function (b) { return b.id === 'help'; })) {
         state.db.forum.boards.push({ id: 'help', name: '互助板块', hot: true });
         changed = true;
       }
 
-      /* 0.2 p_help 帖子 */
       var pHelpData = {
         id: 'p_help', board: 'help', author: '肇事逃逸',
         title: '3号楼停电了！封校后东苑3号楼还有人吗。。',
@@ -90,17 +110,14 @@
       }
 
       if (!existing) {
-        /* 完全不存在 → 整帖补上 */
         state.db.forum.posts.push(pHelpData);
         changed = true;
       } else {
-        /* 存在但可能被快照覆盖成旧版本 → 检查楼层里是否有"加入"按钮 */
         var hasJoinAction = Array.isArray(existing.floors) &&
           existing.floors.some(function (f) {
             return f.action && f.action.type === 'join-group';
           });
         if (!hasJoinAction) {
-          /* 楼层被覆盖 / 缺 action → 用最新的 floors 替换，其他字段保留 */
           existing.floors = pHelpData.floors;
           existing.board = 'help';
           existing.hot = true;
@@ -115,21 +132,25 @@
       if (changed) save();
       return changed;
     }
-
-    /* 启动时先补一次 */
     ensureHelpBoardFull();
-
-    /* 每 2 秒兜底一次 */
     setInterval(ensureHelpBoardFull, 2000);
 
     /* ============================================================
-       1. 拦截 CursorGuide.show —— 问卷已提交时忽略指向问卷的光标
+       2. CursorGuide.show 双重拦截
        ============================================================ */
     var origShow = CursorGuide.show;
     CursorGuide.show = function (selector, label) {
+      // 问卷已提交，忽略指向问卷的光标
       if (flag('s9_questionnaire_done')) {
         if ((typeof selector === 'string' && selector.indexOf('questionnaire') >= 0) ||
             (label && String(label).indexOf('填写问卷') >= 0)) {
+          return;
+        }
+      }
+      // 红包已领，忽略指向红包的光标
+      if (flag('redpacket_opened_rp_huzhu_1000')) {
+        if ((typeof selector === 'string' && selector.indexOf('open-redpacket') >= 0) ||
+            (label && String(label).indexOf('领取红包') >= 0)) {
           return;
         }
       }
@@ -137,7 +158,7 @@
     };
 
     /* ============================================================
-       2. 论坛：渲染前强制补 p_help + 自动切互助板块
+       3. 论坛：渲染前补 p_help + 自动切互助板块
        ============================================================ */
     var origForum = PAGES.forum;
     PAGES.forum = function (params) {
@@ -146,7 +167,6 @@
       var origMount = def.mount;
       def.mount = function (root) {
         if (origMount) origMount(root);
-        /* 周学姐引导去论坛 → 自动切互助板块（只看一次） */
         if (flag('zx_stage') >= 2 && !flag('help_board_seen')) {
           setTimeout(function () {
             var tab = root.querySelector('[data-action="forum-board"][data-id="help"]');
@@ -161,7 +181,6 @@
       return def;
     };
 
-    /* 帖子详情页也补，避免直接路由到 p_help 时找不到 */
     if (PAGES.forumPost) {
       var origForumPost = PAGES.forumPost;
       PAGES.forumPost = function (params) {
@@ -171,7 +190,7 @@
     }
 
     /* ============================================================
-       3. overlay 强制 pointer-events: auto，防点击穿透
+       4. overlay pointer-events: auto
        ============================================================ */
     var layers = document.getElementById('layers');
     if (layers) {
@@ -180,15 +199,19 @@
         if (ov && ov.style.pointerEvents !== 'auto') {
           ov.style.pointerEvents = 'auto';
         }
+        var ov2 = document.getElementById('wxg-night-violation');
+        if (ov2 && ov2.style.pointerEvents !== 'auto') {
+          ov2.style.pointerEvents = 'auto';
+        }
       };
       try {
         new MutationObserver(ensureOverlayPE).observe(layers, { childList: true, subtree: true });
-      } catch (e) { /* 旧浏览器降级 */ }
+      } catch (e) {}
       ensureOverlayPE();
     }
 
     /* ============================================================
-       4. window capture 阶段拦截 submit 重复触发
+       5. window capture 拦截 submit 重复触发
        ============================================================ */
     window.addEventListener('click', function (e) {
       var btn = e.target && e.target.closest && e.target.closest('[data-action="submit-questionnaire"]');
@@ -208,30 +231,391 @@
     }, true);
 
     /* ============================================================
-       5. 包装 ConfirmBox.open，弹窗前清掉残留 overlay
+       6. ConfirmBox.open 统一包装
+          · 弹窗前清残留 overlay
+          · "继续？"回档后做完整重置
        ============================================================ */
-    if (ConfirmBox && ConfirmBox.open) {
-      var origConfirm = ConfirmBox.open;
-      ConfirmBox.open = function (opts) {
-        var ov = document.getElementById('wxg-warning-overlay');
-        if (ov) ov.remove();
-        return origConfirm.call(this, opts);
+    var prevConfirm = ConfirmBox.open;
+    ConfirmBox.open = async function (opts) {
+      var ov = document.getElementById('wxg-warning-overlay');
+      if (ov) ov.remove();
+      var ov2 = document.getElementById('wxg-night-violation');
+      if (ov2) ov2.remove();
+
+      var ok = await prevConfirm.call(this, opts);
+
+      if (opts && opts.title === '继续？' && ok) {
+        try {
+          flag('night_violation_done', false);
+          flag('night_choice_made', false);
+          flag('night_sleep_done', false);
+          flag('night_stage', 0);
+          flag('night_active', true);
+          flag('night_started_done', false);
+          save();
+
+          if (window.StoryExtension && window.StoryExtension._playingLock) {
+            Object.keys(window.StoryExtension._playingLock).forEach(function (k) {
+              window.StoryExtension._playingLock[k] = false;
+            });
+          }
+
+          try { CursorGuide.hide(); } catch (e) {}
+
+          var ov3 = document.getElementById('wxg-night-violation');
+          if (ov3) ov3.remove();
+          var ov4 = document.getElementById('wxg-warning-overlay');
+          if (ov4) ov4.remove();
+
+          if (state.choice && state.choice.nodeId === 'night_ls') {
+            state.choice = null;
+            save();
+          }
+
+          if (state.db.chats && state.db.chats.ls) {
+            state.db.chats.ls.messages = state.db.chats.ls.messages.filter(function (m) {
+              return !['你听到了吗？', '我不敢下去看…你能帮我从猫眼里看一眼吗？？', '求你了！！你一定还没睡对吧', '我进来了。', '我听到开门声了', '我好害怕', '……'].includes(m.text);
+            });
+            var hasFirst = state.db.chats.ls.messages.some(function (m) {
+              return m.text === '陈默...我宿舍有人在敲门';
+            });
+            if (!hasFirst) {
+              state.db.chats.ls.messages.push({
+                id: uid('m'), from: '临爽', text: '陈默...我宿舍有人在敲门', time: '2025-05-09 00:03'
+              });
+            }
+            save();
+          }
+
+          if (state.db.memos) {
+            state.db.memos = state.db.memos.filter(function (m) {
+              return m.id !== 'night1' && m.id !== 'night2';
+            });
+            save();
+          }
+        } catch (err) {
+          console.error('[story-fix] resetNightFlags', err);
+        }
+      }
+      return ok;
+    };
+
+    /* ============================================================
+       7. 启动清理残留
+       ============================================================ */
+    var stale1 = document.getElementById('wxg-warning-overlay');
+    if (stale1) stale1.remove();
+    var stale2 = document.getElementById('wxg-night-violation');
+    if (stale2) stale2.remove();
+
+    /* ============================================================
+       8. CHOICES.huzhu_3.a / b 入口拦截（彻底防重跑）
+       ============================================================ */
+    (function wrapHuzhu3() {
+      if (!CHOICES.huzhu_3) return;
+      var origA = CHOICES.huzhu_3.a;
+      if (typeof origA === 'function' && !origA.__fixWrapped) {
+        CHOICES.huzhu_3.a = async function () {
+          if (flag('huzhu_done')) return;
+          if (_lock['huzhu']) return;
+          return origA.apply(this, arguments);
+        };
+        CHOICES.huzhu_3.a.__fixWrapped = true;
+      }
+      var origB = CHOICES.huzhu_3.b;
+      if (typeof origB === 'function' && !origB.__fixWrapped) {
+        CHOICES.huzhu_3.b = async function () {
+          if (flag('huzhu_done')) return;
+          if (flag('redpacket_opened_rp_huzhu_1000')) return;
+          if (flag('huzhu_redpacket_pending')) return;
+          if (_lock['huzhu']) return;
+          return origB.apply(this, arguments);
+        };
+        CHOICES.huzhu_3.b.__fixWrapped = true;
+      }
+    })();
+
+    /* ============================================================
+       9. handleOpenRedpacket 覆盖（领取后 stage 8→9）
+       ============================================================ */
+    if (EXT2 && typeof EXT2.handleOpenRedpacket === 'function') {
+      var origHandleRp = EXT2.handleOpenRedpacket;
+      EXT2.handleOpenRedpacket = async function (rid) {
+        if (flag('redpacket_opened_' + rid)) {
+          Toast.show('已领取过此红包');
+          if (flag('huzhu_stage') === 8) {
+            flag('huzhu_stage', 9);
+            save();
+          }
+          CursorGuide.hide();
+          return;
+        }
+        await origHandleRp(rid);
+        if (flag('huzhu_stage') === 8) {
+          flag('huzhu_stage', 9);
+          save();
+        }
       };
     }
 
     /* ============================================================
-       6. 启动时清理残留（旧存档卡死时能自愈）
+       10. 红包卡片装饰（显示 ￥1000.00）
        ============================================================ */
-    var stale = document.getElementById('wxg-warning-overlay');
-    if (stale) stale.remove();
+    function decorateRedpackets(root) {
+      var cards = root.querySelectorAll('.redpacket-card');
+      if (!cards.length) return;
+      Array.prototype.forEach.call(cards, function (card) {
+        var rid = card.dataset.rid;
+        if (!rid) return;
+        var chat = state.db.chats && state.db.chats.huzhu;
+        if (!chat || !Array.isArray(chat.messages)) return;
+        var msg = chat.messages.find(function (m) { return m.type === 'redpacket' && m.rpId === rid; });
+        if (!msg) return;
+        var amount = typeof msg.amount === 'number' ? msg.amount : 0;
+        var amountStr = '￥' + amount.toFixed(2);
+        var opened = flag('redpacket_opened_' + rid);
+        var rpTitle = card.querySelector('.rp-title');
+        var rpDesc = card.querySelector('.rp-desc');
+        if (rpTitle && !rpTitle.dataset.amountSet) {
+          rpTitle.textContent = amountStr + ' · ' + (msg.title || '恭喜发财，大吉大利');
+          rpTitle.dataset.amountSet = '1';
+        }
+        if (rpDesc) {
+          rpDesc.textContent = opened ? '已领取 · 已存入钱包' : '专属红包 · 点击领取';
+        }
+        var btn = card.querySelector('.rp-btn');
+        if (btn) btn.textContent = opened ? '已领取' : '领取';
+      });
+    }
 
     /* ============================================================
-       7. 暴露给外部使用
+       11. 入睡按钮即时出现
        ============================================================ */
-    window.StoryFix = {
-      ensureHelpBoardFull: ensureHelpBoardFull
+    function tryAddSleepButtonNow(root) {
+      if (!flag('s11_sleep_ready')) return;
+      var cur = Router.current();
+      if (!cur || cur.page !== 'chat' || cur.params.id !== 'by') return;
+      var vp = document.getElementById('viewport');
+      if (!vp) return;
+      if (vp.querySelector('[data-action="do-sleep"]')) return;
+      var btn = document.createElement('button');
+      btn.className = 'sleep-btn-top';
+      btn.setAttribute('data-action', 'do-sleep');
+      btn.textContent = '入睡';
+      vp.appendChild(btn);
+      setTimeout(function () {
+        var cur2 = Router.current();
+        if (cur2 && cur2.page === 'chat' && cur2.params.id === 'by') {
+          CursorGuide.show('[data-action="do-sleep"]', '提前上床躺一会吧');
+        }
+      }, 400);
+    }
+
+    /* ============================================================
+       12. huzhu_stage === 9 兜底补完后续消息
+       ============================================================ */
+    function handleHuzhuStage9() {
+      if (flag('huzhu_stage') !== 9) return;
+      if (flag('huzhu_done')) return;
+      if (flag('huzhu_after_rp_done')) return;
+      if (_lock['huzhu_rp_cont_fix']) return;
+      if (!flag('redpacket_opened_rp_huzhu_1000')) return;
+      setTimeout(runHuzhuAfterRpOnce, 300);
+    }
+
+    async function runHuzhuAfterRpOnce() {
+      if (_lock['huzhu_rp_cont_fix']) return;
+      if (flag('huzhu_after_rp_done')) return;
+      if (flag('huzhu_done')) return;
+      _lock['huzhu_rp_cont_fix'] = true;
+      flag('huzhu_after_rp_done', true);
+      save();
+      try {
+        var cid = 'huzhu';
+        var sp = window.StorySpeed;
+        if (!sp) return;
+        await sp.ensureMsgP(cid, { from: '苏青', text: '草，怎么还是专属红包，我领不了' }, 1600);
+        await sp.ensureMsgP(cid, { from: '周未', text: '我是一个愤怒的普通人，@钱逸时 现在要小心了' }, 1700);
+        await sp.ensureMsgP(cid, { from: '许双荞', text: '。到底是谁修电闸' }, 1500);
+        await sp.ensureMsgP(cid, { from: '钱逸时', text: '错了错了错了，明天每个人找我领超级大红包，现在我限额了…万恶的渠中校园钱包还特么有限额' }, 1900);
+        if (typeof addTrust === 'function') addTrust(['钱逸时'], 3);
+        if (typeof trustNote === 'function') {
+          await sp.ensureMsgP(cid, { type: 'system', text: trustNote(['钱逸时'], 3) }, 800);
+        }
+        flag('huzhu_done', true);
+        save();
+        await sleep(sp.adjust(800));
+        if (EXT2 && typeof EXT2.triggerNoticeV9 === 'function') {
+          EXT2.triggerNoticeV9();
+        }
+      } finally {
+        _lock['huzhu_rp_cont_fix'] = false;
+      }
+    }
+
+    /* ============================================================
+       13. 夜间备忘录构建（覆盖 CHOICES.night_ls）
+       ============================================================ */
+    function buildNight1Memo() {
+      if (state.db.memos.some(function (m) { return m.id === 'night1'; })) return;
+      state.db.memos.push({
+        id: 'night1',
+        title: '夜间记录·1',
+        type: 'night_scene',
+        time: fmtFull(sysNow()),
+        steps: [
+          {
+            text: '你小声下了床，没惊动邓许。奇怪的是，此时敲门声似乎越来越大了，就好像移动到了你门前一样。',
+            speed: 50,
+            button: '查看猫眼',
+            nextTrigger: 'night1Cat'
+          },
+          {
+            text: '那敲门声，真正敲的就是412的宿舍门。',
+            color: 'red',
+            speed: 80,
+            delay: 800,
+            nextTrigger: 'night1Red'
+          },
+          {
+            text: '你 对 上 了 那 人 的 眼 睛 。\n\n是 临 爽。',
+            color: 'red',
+            large: true,
+            speed: 320,
+            delay: 800,
+            nextTrigger: 'night1Violation'
+          }
+        ]
+      });
+      save();
+    }
+
+    function buildNight2Memo() {
+      if (state.db.memos.some(function (m) { return m.id === 'night2'; })) return;
+      state.db.memos.push({
+        id: 'night2',
+        title: '夜间记录·2',
+        type: 'night_scene',
+        time: fmtFull(sysNow()),
+        steps: [
+          {
+            text: '对不起，临爽，我必须按照规则装睡…或者，对面发消息求助的人，根本就不是我的同学临爽了。\n\n无论如何，现在赶紧睡觉吧，否则早晚会被发现。\n\n明天一切都会好起来的……但愿吧。',
+            speed: 55,
+            button: '入睡',
+            nextTrigger: 'nightSleep'
+          }
+        ]
+      });
+      save();
+    }
+
+    if (CHOICES.night_ls) {
+      CHOICES.night_ls.a = async function () {
+        if (flag('night_choice_made')) return;
+        flag('night_choice_made', 'a');
+        save();
+        var cid = 'ls';
+        state.choice = null;
+        save();
+        refreshChat(cid);
+        var sp = window.StorySpeed;
+        if (sp) await sp.ensureMsgP(cid, { from: 'me', text: '好，我这就过去帮你看看，别害怕' }, 800);
+        await sleep((sp ? sp.adjust(600) : 800));
+        buildNight1Memo();
+        Router.push('memoDetail', { id: 'night1' });
+      };
+
+      CHOICES.night_ls.c = async function () {
+        if (flag('night_choice_made') && flag('night_choice_made') !== 'sleep') return;
+        flag('night_choice_made', 'sleep');
+        save();
+        var cid = 'ls';
+        state.choice = null;
+        save();
+        refreshChat(cid);
+        var sp = window.StorySpeed;
+        await sleep((sp ? sp.adjust(600) : 800));
+        NotifService.push({
+          id: 'n_night_xiaoqu',
+          title: '小渠',
+          detail: '你……真的睡了？',
+          target: { page: 'memos', params: {} }
+        });
+        await sleep((sp ? sp.adjust(1200) : 1600));
+        buildNight2Memo();
+        Router.push('memoDetail', { id: 'night2' });
+      };
+    }
+
+    /* ============================================================
+       14. 包装 PAGES.chat.mount
+          · decorateRedpackets
+          · tryAddSleepButtonNow
+          · handleHuzhuStage9
+       ============================================================ */
+    var prevChat = PAGES.chat;
+    PAGES.chat = function (params) {
+      var def = prevChat(params);
+      var prevMount = def.mount;
+      def.mount = function (root) {
+        if (prevMount) prevMount(root);
+        try {
+          decorateRedpackets(root);
+          tryAddSleepButtonNow(root);
+          if (params.id === 'huzhu') {
+            handleHuzhuStage9();
+          }
+        } catch (e) {
+          console.error('[story-fix] mount', e);
+        }
+      };
+      return def;
     };
 
-    console.log('[story-fix v1.1] 已加载：互助板块兜底 / 光标拦截 / 黑屏防穿透 / 提交防抖');
+    /* ============================================================
+       15. 定时兜底
+       ============================================================ */
+    // 清理红包残留光标
+    setInterval(function () {
+      if (flag('redpacket_opened_rp_huzhu_1000') &&
+          CursorGuide.current &&
+          CursorGuide.current.selector &&
+          String(CursorGuide.current.selector).indexOf('open-redpacket') >= 0) {
+        CursorGuide.hide();
+      }
+    }, 500);
+
+    // stage 8 兜底推 9（红包已领但 stage 卡在 8）
+    setInterval(function () {
+      if (flag('huzhu_stage') === 8 &&
+          flag('redpacket_opened_rp_huzhu_1000') &&
+          !flag('huzhu_done')) {
+        flag('huzhu_stage', 9);
+        save();
+      }
+    }, 1000);
+
+    // 入睡按钮兜底（如果因为某些原因 PAGES.chat.mount 没被执行）
+    setInterval(function () {
+      if (!flag('s11_sleep_ready')) return;
+      var cur = Router.current();
+      if (!cur || cur.page !== 'chat' || cur.params.id !== 'by') return;
+      var vp = document.getElementById('viewport');
+      if (!vp) return;
+      if (vp.querySelector('[data-action="do-sleep"]')) return;
+      tryAddSleepButtonNow(document.querySelector('.page-body') || document.body);
+    }, 800);
+
+    /* ============================================================
+       16. 暴露 API
+       ============================================================ */
+    window.StoryFix = {
+      ensureHelpBoardFull: ensureHelpBoardFull,
+      decorateRedpackets: decorateRedpackets,
+      tryAddSleepButtonNow: tryAddSleepButtonNow,
+      runHuzhuAfterRpOnce: runHuzhuAfterRpOnce
+    };
+
+    console.log('[story-fix v2.0] 已加载：合并 fix + ext2-fix，红包/入睡/夜间/回档全修复');
   });
 })();
