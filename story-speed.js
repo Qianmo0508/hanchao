@@ -1,21 +1,23 @@
 /* ================================================================
-   story-speed.js  v3.1
+   story-speed.js  v4.0
    加载顺序：story-patch.js → story-extension.js → story-speed.js
+             → story-storyline.js → story-extension-2.js → story-fix.js
 
-   v3.1 修复：
-   【选项前后速度仍不均】根因：主代码 CHOICES.grp1/grp2/grp3 的
-   meSay/themSay/sysNote 传入的 delay 本身就短（400/700/800），
-   覆盖后只是乘以速度系数，基准值还在起决定作用。
-   修复：彻底忽略主代码传入的 delay，改为固定基准 —— 
-     · meSay    一律 base 800ms
-     · themSay  一律 base 1500ms
-     · sysNote  一律 base 800ms
-   再乘上 getSpeed()（默认 1.3x），所有场景（选项前/选项后）
-   角色 1950ms、玩家 1040ms、系统 1040ms，绝对均匀。
+   v4.0 修复（相对 v3.1）：
+   【关键】story-storyline v2.2 会重新覆盖 window.themSay / meSay / sysNote，
+          导致主代码 CHOICES.grp1/grp2/grp3 走 storyline 的快速版本，
+          从而"选项前 520ms、选项后 1950ms"节奏不一致。
+   修复方案：
+     · themSay / meSay / sysNote 改为【直接实现】，不再委托 _orig
+     · 加载时 + setInterval(300ms) 持续 rebind，防止被后续文件覆盖
+     · 忽略主代码传入的 delay，固定基准：
+       themSay 1500、meSay 800、sysNote 800，再 × getSpeed()
+     · 默认速度 1.3 → 1.5（保留用户主动选过的值，用 patchDefaults 标记迁移）
+     · ensureMsgP：已存在消息也给 1/4 短延时，避免刷新后瞬闪
 
-   保留 v3.0 全部内容：
-   1. 论坛帖子 p5~p10 恢复（加载时 + 每次渲染强制合并）
-   2. 独立管理 ls / by 所有阶段（不依赖 story-patch / extension）
+   保留 v3.1 全部内容：
+   1. 论坛帖子 p5~p10（加载 + 每次渲染强制合并）
+   2. ls / by 全阶段接管（不依赖 patch / extension）
    3. 设置 → 触感反馈下方"消息显示速度"六档
    4. stage 迁移、断点续播
    ================================================================ */
@@ -56,17 +58,95 @@
     /* ============================================================
        2. 速度工具
        ============================================================ */
-    if (state.settings.msgSpeed === undefined) {
-      state.settings.msgSpeed = 1.3;
+    if (!state.patchDefaults) state.patchDefaults = {};
+    if (!state.patchDefaults.speedV4Upgraded) {
+      if (state.settings.msgSpeed === undefined || state.settings.msgSpeed === 1.3) {
+        state.settings.msgSpeed = 1.5;
+      }
+      state.patchDefaults.speedV4Upgraded = true;
       save();
     }
+    if (state.settings.msgSpeed === undefined) {
+      state.settings.msgSpeed = 1.5;
+      save();
+    }
+
     function getSpeed() {
       var v = state.settings.msgSpeed;
-      return (typeof v === 'number' && v > 0) ? v : 1.3;
+      return (typeof v === 'number' && v > 0) ? v : 1.5;
     }
     function _dl(base) { return Math.round(base * getSpeed()); }
 
+    /* ============================================================
+       3. themSay / meSay / sysNote —— 直接实现 + setInterval rebind
+          【v4.0 关键修复】忽略主代码 delay，固定基准。
+          · themSay base 1500ms
+          · meSay   base 800ms
+          · sysNote base 800ms
+          × getSpeed()（默认 1.5x → 角色 2250ms、玩家 1200ms）
+       ============================================================ */
+    var finalThemSay = async function (cid, name, text, delay) {
+      var gen = window.__storylineGeneration;
+      if (window.__storylineFrozen) return;
+      await sleep(_dl(1500));
+      if (window.__storylineGeneration !== gen) return;
+      if (window.__storylineFrozen) return;
+      var chat = state.db && state.db.chats && state.db.chats[cid];
+      if (!chat) return;
+      if (!Array.isArray(chat.messages)) chat.messages = [];
+      if (chat.messages.some(function (m) { return m.from === name && m.text === text; })) return;
+      chat.messages.push({ id: uid('m'), from: name, text: text, time: storyTime() });
+      save();
+      refreshChat(cid);
+    };
+    finalThemSay.__speedWrapper = true;
+
+    var finalMeSay = async function (cid, text, delay) {
+      var gen = window.__storylineGeneration;
+      if (window.__storylineFrozen) return;
+      await sleep(_dl(800));
+      if (window.__storylineGeneration !== gen) return;
+      if (window.__storylineFrozen) return;
+      var chat = state.db && state.db.chats && state.db.chats[cid];
+      if (!chat) return;
+      if (!Array.isArray(chat.messages)) chat.messages = [];
+      if (chat.messages.some(function (m) { return m.from === 'me' && m.text === text; })) return;
+      chat.messages.push({ id: uid('m'), from: 'me', text: text, time: storyTime() });
+      save();
+      refreshChat(cid);
+    };
+    finalMeSay.__speedWrapper = true;
+
+    var finalSysNote = async function (cid, text, delay) {
+      var gen = window.__storylineGeneration;
+      if (window.__storylineFrozen) return;
+      await sleep(_dl(800));
+      if (window.__storylineGeneration !== gen) return;
+      if (window.__storylineFrozen) return;
+      var chat = state.db && state.db.chats && state.db.chats[cid];
+      if (!chat) return;
+      if (!Array.isArray(chat.messages)) chat.messages = [];
+      if (chat.messages.some(function (m) { return m.type === 'system' && m.text === text; })) return;
+      chat.messages.push({ id: uid('m'), type: 'system', text: text, time: storyTime() });
+      save();
+      refreshChat(cid);
+    };
+    finalSysNote.__speedWrapper = true;
+
+    function rebindSay() {
+      if (window.themSay !== finalThemSay) window.themSay = finalThemSay;
+      if (window.meSay !== finalMeSay) window.meSay = finalMeSay;
+      if (window.sysNote !== finalSysNote) window.sysNote = finalSysNote;
+    }
+    rebindSay();
+    setInterval(rebindSay, 300);
+
+    /* ============================================================
+       4. ensureMsgP —— 幂等 + 已存在时短延时（避免刷新后瞬闪）
+       ============================================================ */
     async function ensureMsgP(cid, msg, baseDelay) {
+      var gen = window.__storylineGeneration;
+      if (window.__storylineFrozen) return;
       var chat = state.db.chats[cid];
       if (!chat) return;
       if (!Array.isArray(chat.messages)) chat.messages = [];
@@ -75,44 +155,20 @@
         if (msg.type === 'card') return m.type === 'card' && m.title === msg.title && m.desc === msg.desc;
         return m.from === msg.from && m.text === msg.text;
       });
-      if (exists) return;
+      if (exists) {
+        if (baseDelay && baseDelay > 0) await sleep(_dl(Math.round(baseDelay / 4)));
+        return;
+      }
       if (baseDelay && baseDelay > 0) await sleep(_dl(baseDelay));
+      if (window.__storylineGeneration !== gen) return;
+      if (window.__storylineFrozen) return;
       chat.messages.push(Object.assign({ id: uid('m'), time: storyTime() }, msg));
       save();
       refreshChat(cid);
     }
 
     /* ============================================================
-       3. 完全覆盖 themSay / meSay / sysNote
-          关键：忽略主代码传入的 delay，全部用固定基准。
-          · themSay  base 1500ms（角色消息）
-          · meSay    base 800ms （玩家消息）
-          · sysNote  base 800ms （系统消息）
-          × getSpeed() 后
-          · 角色 1950ms、玩家 1040ms、系统 1040ms（默认 1.3x）
-       ============================================================ */
-    var _origThemSay = window.themSay;
-    var _origMeSay = window.meSay;
-    var _origSysNote = window.sysNote;
-
-    if (typeof _origThemSay === 'function') {
-      window.themSay = function (cid, name, text, delay) {
-        return _origThemSay(cid, name, text, _dl(1500));
-      };
-    }
-    if (typeof _origMeSay === 'function') {
-      window.meSay = function (cid, text, delay) {
-        return _origMeSay(cid, text, _dl(800));
-      };
-    }
-    if (typeof _origSysNote === 'function') {
-      window.sysNote = function (cid, text, delay) {
-        return _origSysNote(cid, text, _dl(800));
-      };
-    }
-
-    /* ============================================================
-       4. 论坛帖子恢复
+       5. 论坛帖子恢复
        ============================================================ */
     var MORE_POSTS = [
       { id: 'p5', board: 'gossip', author: '路过的风', title: '寒潮封校，宿舍暖气为什么是凉的？',
@@ -177,7 +233,7 @@
     };
 
     /* ============================================================
-       5. playingLock
+       6. playingLock
        ============================================================ */
     var _lock = (window.StoryExtension && window.StoryExtension._playingLock)
       ? window.StoryExtension._playingLock
@@ -186,7 +242,7 @@
     else if (!window.StoryExtension._playingLock) window.StoryExtension._playingLock = _lock;
 
     /* ============================================================
-       6. stage 迁移
+       7. stage 迁移
        ============================================================ */
     (function migrateStages() {
       var lsStage = flag('ls_stage') || 0;
@@ -217,7 +273,7 @@
     })();
 
     /* ============================================================
-       7. PAGES.chat 完整接管 mount
+       8. PAGES.chat 完整接管 mount
        ============================================================ */
     var prevChat = PAGES.chat;
     PAGES.chat = function (params) {
@@ -237,7 +293,7 @@
     }
 
     /* ============================================================
-       8. ls 流程
+       9. ls 流程
        ============================================================ */
     function handleLsSpeed() {
       if (!flag('ls_added')) return;
@@ -300,7 +356,7 @@
     }
 
     /* ============================================================
-       9. by 流程
+       10. by 流程
        ============================================================ */
     function handleBySpeed() {
       var chat = state.db.chats.by;
@@ -412,7 +468,7 @@
     }
 
     /* ============================================================
-       10. s9
+       11. s9
        ============================================================ */
     function triggerS9GroupSpeed() {
       if (flag('s9_notified')) return;
@@ -498,7 +554,7 @@
     }
 
     /* ============================================================
-       11. CHOICES.ls_opening / grp_s9
+       12. CHOICES.ls_opening / grp_s9
        ============================================================ */
     CHOICES.ls_opening = {
       async a() {
@@ -603,7 +659,7 @@
     };
 
     /* ============================================================
-       12. 设置页速度入口
+       13. 设置页速度入口
        ============================================================ */
     var prevSettings = PAGES.settings;
     PAGES.settings = function () {
@@ -626,11 +682,11 @@
 
     var SPEED_OPTIONS = [
       { v: 1.0, label: '1.0x · 原速' },
-      { v: 1.1, label: '1.1x · 稍快' },
-      { v: 1.3, label: '1.3x · 推荐' },
-      { v: 1.5, label: '1.5x · 慢速' },
-      { v: 1.8, label: '1.8x · 很慢' },
-      { v: 2.0, label: '2.0x · 极慢' }
+      { v: 1.2, label: '1.2x · 稍快' },
+      { v: 1.5, label: '1.5x · 推荐' },
+      { v: 1.8, label: '1.8x · 慢速' },
+      { v: 2.0, label: '2.0x · 很慢' },
+      { v: 2.5, label: '2.5x · 极慢' }
     ];
 
     PAGES.msgSpeed = function () {
@@ -674,7 +730,7 @@
     }, true);
 
     /* ============================================================
-       13. 暴露 API
+       14. 暴露 API
        ============================================================ */
     window.StorySpeed = {
       getSpeed: getSpeed,
@@ -687,6 +743,6 @@
       SPEED_OPTIONS: SPEED_OPTIONS
     };
 
-    console.log('[story-speed v3.1] 已加载，速度 ' + getSpeed() + 'x，论坛帖子 ' + state.db.forum.posts.length + ' 条');
+    console.log('[story-speed v4.0] 已加载，速度 ' + getSpeed() + 'x，论坛帖子 ' + state.db.forum.posts.length + ' 条，themSay/meSay/sysNote 已锁定');
   });
 })();
